@@ -1,13 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/StarGames2025/Logger"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -26,36 +28,20 @@ import (
 	"github.com/nfnt/resize"
 )
 
-var (
-	logger       = Logger.NewLogger(Logger.DEBUG)
-	grupsList    []*types.GroupInfo
-	contactsList []struct {
-		JID     types.JID
-		Contact types.ContactInfo
+func StartServer() {
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		logger.Fatal("SERVER_START_ERROR", err.Error())
 	}
-	chatlist []struct {
-		JID  types.JID
-		Name string
-	}
+	defer ln.Close()
 
-	exitCodes = map[string]int{
-		"ERROR":                -1,
-		"SUCCESS":              0,
-		"SHUTDOWN":             0,
-		"DB_INIT_ERROR":        10,
-		"DEVICE_STORE_ERROR":   11,
-		"CLIENT_CONNECT_ERROR": 12,
-		"QR_GENERATE_ERROR":    13,
-		"QR_OPEN_ERROR":        14,
-		"QR_DECODE_ERROR":      15,
-		"QR_RESIZE_ERROR":      16,
-		"QR_FILE_CREATE_ERROR": 17,
-		"QR_FILE_ENCODE_ERROR": 18,
-		"QR_RENDER_ERROR":      19,
-		"GROUP_FETCH_ERROR":    20,
-		"CONTACT_FETCH_ERROR":  21,
+	logger.Info("Server started on port 8080")
+
+	connection, err = ln.Accept()
+	if err != nil {
+		logger.Fatal("SERVER_ACCEPT_ERROR", err.Error())
 	}
-)
+}
 
 func GetQRCodeImage(imageString string, width int, height int) string {
 	logger.Info("Generating QR Code...")
@@ -66,19 +52,19 @@ func GetQRCodeImage(imageString string, width int, height int) string {
 
 	file, err := os.Open("qrcode.png")
 	if err != nil {
-		logger.Error("QR_OPEN_ERROR", "Failed to open QR Code file:", err.Error())
+		logger.Fatal("QR_OPEN_ERROR", "Failed to open QR Code file:", err.Error())
 	}
 	defer file.Close()
 
 	img, _, err := image.Decode(file)
 	if err != nil {
-		logger.Error("QR_DECODE_ERROR", "Failed to decode QR Code image:", err.Error())
+		logger.Fatal("QR_DECODE_ERROR", "Failed to decode QR Code image:", err.Error())
 	}
 
 	logger.Debug("Resizing QR Code image...")
 	resizedImg := resize.Resize(uint(width), uint(height), img, resize.Lanczos3)
 	if resizedImg.Bounds().Dx() == 0 || resizedImg.Bounds().Dy() == 0 {
-		logger.Error("QR_RESIZE_ERROR", "Resized QR Code image is invalid")
+		logger.Fatal("QR_RESIZE_ERROR", "Resized QR Code image is invalid")
 	}
 
 	tmpFile, err := os.Create("temp_resized.png")
@@ -106,6 +92,33 @@ func GetQRCodeImage(imageString string, width int, height int) string {
 	return imgStr
 }
 
+func SendMsg(writer *bufio.Writer, msg string) {
+	writer.WriteString(msg)
+	writer.Flush()
+}
+
+func SendBaseData() {
+	writer := bufio.NewWriter(connection)
+
+	for _, contact := range contactsList {
+		jsoncontact, err := json.Marshal(contact)
+		if err != nil {
+			logger.Fatal("DATA_MARSHAL_ERROR", "Failed to marshal contact data:", err.Error())
+		}
+		SendMsg(writer, fmt.Sprintf("SetContact\\\\%s\n", jsoncontact))
+	}
+
+	for _, group := range grupsList {
+		groupData, err := json.Marshal(group)
+		if err != nil {
+			logger.Fatal("DATA_MARSHAL_ERROR", "Failed to marshal group data:", err.Error())
+		}
+		SendMsg(writer, fmt.Sprintf("SetGroup\\\\%s\n", groupData))
+	}
+
+	SendMsg(writer, "END\\\\\n")
+}
+
 func eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
@@ -117,20 +130,17 @@ func eventHandler(evt interface{}) {
 }
 
 func main() {
-	logger = Logger.NewLogger(Logger.DEBUG)
-	logger.ExitCodes = exitCodes
-
 	logger.Info("Starting WhatsApp Client...")
 
 	dbLog := waLog.Stdout("Database", "ERROR", true)
 	container, err := sqlstore.New("sqlite3", "file:sqlstore.db?_foreign_keys=on", dbLog)
 	if err != nil {
-		logger.Error("DB_INIT_ERROR", "Failed to initialize database:", err.Error())
+		logger.Fatal("DB_INIT_ERROR", "Failed to initialize database:", err.Error())
 	}
 
 	deviceStore, err := container.GetFirstDevice()
 	if err != nil {
-		logger.Error("DEVICE_STORE_ERROR", "Failed to get device store:", err.Error())
+		logger.Fatal("DEVICE_STORE_ERROR", "Failed to get device store:", err.Error())
 	}
 
 	clientLog := waLog.Stdout("Client", "ERROR", true)
@@ -142,7 +152,7 @@ func main() {
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
-			logger.Error("CLIENT_CONNECT_ERROR", "Failed to connect client:", err.Error())
+			logger.Fatal("CLIENT_CONNECT_ERROR", "Failed to connect client:", err.Error())
 		}
 
 		for evt := range qrChan {
@@ -157,13 +167,13 @@ func main() {
 		logger.Info("Session found. Connecting...")
 		err = client.Connect()
 		if err != nil {
-			logger.Error("CLIENT_CONNECT_ERROR", "Failed to connect client:", err.Error())
+			logger.Fatal("CLIENT_CONNECT_ERROR", "Failed to connect client:", err.Error())
 		}
 
 		logger.Info("Fetching joined groups...")
 		groups, err := client.GetJoinedGroups()
 		if err != nil {
-			logger.Error("GROUP_FETCH_ERROR", "Failed to fetch groups:", err.Error())
+			logger.Fatal("GROUP_FETCH_ERROR", "Failed to fetch groups:", err.Error())
 		} else {
 			logger.Info(fmt.Sprintf("Found %d groups.", len(groups)))
 		}
@@ -183,13 +193,13 @@ func main() {
 		logger.Info("Fetching contacts...")
 		contacts, err := client.Store.Contacts.GetAllContacts()
 		if err != nil {
-			logger.Error("CONTACT_FETCH_ERROR", "Failed to fetch contacts:", err.Error())
+			logger.Fatal("CONTACT_FETCH_ERROR", "Failed to fetch contacts:", err.Error())
 		} else {
 			logger.Info(fmt.Sprintf("Found %d contacts.", len(contacts)))
 		}
 
 		for jid, contact := range contacts {
-			logger.Debug(fmt.Sprintf("Contact: %s - %s", jid, contact.PushName))
+			logger.Debug(fmt.Sprintf("%-20s - %s", jid, contact.PushName))
 			contactsList = append(contactsList, struct {
 				JID     types.JID
 				Contact types.ContactInfo
@@ -207,15 +217,28 @@ func main() {
 		}
 	}
 
+	logger.Info("Starting Server...")
+	StartServer()
+
+	time.Sleep(1 * time.Second)
+
+	logger.Info("Sending data to TUI...")
+	SendBaseData()
+
 	// Signal-Handling
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	logger.Info("Client is running. Press Ctrl+C to stop.")
 	<-c
 
+	fmt.Print("\033[100D")
+	fmt.Print("\033[2K")
+
 	logger.Info("Shutting down...")
 	client.Disconnect()
-	logger.Info("Disconnected. ")
+	logger.Debug("Disconnected. ")
+	defer connection.Close()
+	logger.Debug("Connection closed.")
 	logger.Info("Exiting.")
 	os.Exit(exitCodes["SHUTDOWN"])
 }
