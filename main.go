@@ -1,17 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -26,22 +27,47 @@ import (
 
 	"github.com/blacktop/go-termimg"
 	"github.com/nfnt/resize"
+
+	"github.com/StarGames2025/Logger"
 )
 
-func StartServer() {
-	ln, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		logger.Fatal("SERVER_START_ERROR", err.Error())
+var (
+	exitCodes = map[string]int{
+		"ERROR":                       -1,
+		"SUCCESS":                     0,
+		"SHUTDOWN":                    0,
+		"DB_INIT_ERROR":               10,
+		"DEVICE_STORE_ERROR":          11,
+		"LOGGER_ERROR":      	       12,
+		"QR_GENERATE_ERROR":           13,
+		"QR_OPEN_ERROR":               14,
+		"QR_DECODE_ERROR":             15,
+		"QR_RESIZE_ERROR":             16,
+		"QR_FILE_CREATE_ERROR":        17,
+		"QR_FILE_ENCODE_ERROR":        18,
+		"QR_RENDER_ERROR":             19,
+		"GROUP_FETCH_ERROR":           20,
+		"CONTACT_FETCH_ERROR":         21,
+		"DATA_MARSHAL_ERROR":          22,
+		"DATA_UNMARSHAL_ERROR":        23,
 	}
-	defer ln.Close()
 
-	logger.Info("Server started on port 8080")
+	logger, _ = Logger.NewLogger(Logger.DEBUG, "./.log", false)
 
-	connection, err = ln.Accept()
-	if err != nil {
-		logger.Fatal("SERVER_ACCEPT_ERROR", err.Error())
+	grupsList    []*types.GroupInfo
+	contactsList []contactStruct
+	chatlist     []struct {
+		JID  types.JID
+		Name string
 	}
-}
+)
+
+type (
+	contactStruct struct {
+		JID     types.JID
+		Contact types.ContactInfo
+	}
+)
 
 func GetQRCodeImage(imageString string, width int, height int) string {
 	logger.Info("Generating QR Code...")
@@ -92,33 +118,6 @@ func GetQRCodeImage(imageString string, width int, height int) string {
 	return imgStr
 }
 
-func SendMsg(writer *bufio.Writer, msg string) {
-	writer.WriteString(msg)
-	writer.Flush()
-}
-
-func SendBaseData() {
-	writer := bufio.NewWriter(connection)
-
-	for _, contact := range contactsList {
-		jsoncontact, err := json.Marshal(contact)
-		if err != nil {
-			logger.Fatal("DATA_MARSHAL_ERROR", "Failed to marshal contact data:", err.Error())
-		}
-		SendMsg(writer, fmt.Sprintf("SetContact\\\\%s\n", jsoncontact))
-	}
-
-	for _, group := range grupsList {
-		groupData, err := json.Marshal(group)
-		if err != nil {
-			logger.Fatal("DATA_MARSHAL_ERROR", "Failed to marshal group data:", err.Error())
-		}
-		SendMsg(writer, fmt.Sprintf("SetGroup\\\\%s\n", groupData))
-	}
-
-	SendMsg(writer, "END\\\\\n")
-}
-
 func eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
@@ -133,12 +132,12 @@ func main() {
 	logger.Info("Starting WhatsApp Client...")
 
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-	container, err := sqlstore.New("sqlite3", "file:sqlstore.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:sqlstore.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Fatal("DB_INIT_ERROR", "Failed to initialize database:", err.Error())
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		logger.Fatal("DEVICE_STORE_ERROR", "Failed to get device store:", err.Error())
 	}
@@ -191,7 +190,7 @@ func main() {
 		}
 
 		logger.Info("Fetching contacts...")
-		contacts, err := client.Store.Contacts.GetAllContacts()
+		contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
 		if err != nil {
 			logger.Fatal("CONTACT_FETCH_ERROR", "Failed to fetch contacts:", err.Error())
 		} else {
@@ -217,18 +216,11 @@ func main() {
 		}
 	}
 
-	logger.Info("Starting Server...")
-	StartServer()
-
 	time.Sleep(1 * time.Second)
-
-	logger.Info("Sending data to TUI...")
-	SendBaseData()
 
 	// Signal-Handling
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	logger.Info("Client is running. Press Ctrl+C to stop.")
 	<-c
 
 	fmt.Print("\033[100D")
@@ -236,9 +228,10 @@ func main() {
 
 	logger.Info("Shutting down...")
 	client.Disconnect()
-	logger.Debug("Disconnected. ")
-	defer connection.Close()
-	logger.Debug("Connection closed.")
 	logger.Info("Exiting.")
 	os.Exit(exitCodes["SHUTDOWN"])
+}
+
+func init() {
+	logger.ExitCodes = exitCodes
 }
