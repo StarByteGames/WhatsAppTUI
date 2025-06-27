@@ -59,6 +59,9 @@ var (
 		JID  types.JID
 		Name string
 	}
+
+	client      *whatsmeow.Client
+	chatBuffers = make(map[types.JID][]string)
 )
 
 type (
@@ -122,8 +125,32 @@ func eventHandler(evt interface{}) {
 	case *events.Message:
 		sender := v.Info.PushName
 		message := v.Message.GetConversation()
+		logger.Info(fmt.Sprintf("Message from %s in chat %s: %s", sender, v.Info.Chat.String(), message))
 
-		logger.Info(fmt.Sprintf("Received a message from %s: %s\n\r", sender, message))
+		chatBuffers[v.Info.Chat] = append(chatBuffers[v.Info.Chat], fmt.Sprintf("%s: %s", sender, message))
+	case *events.HistorySync:
+		logger.Info(fmt.Sprintf("History sync with %d conversations", len(v.Data.Conversations)))
+		for _, conv := range v.Data.Conversations {
+			jid, err := types.ParseJID(*conv.ID)
+			if err != nil {
+				logger.Warning("Invalid JID in history sync: " + err.Error())
+				continue
+			}
+			logger.Info("History for chat: " + jid.String())
+
+			for _, wm := range conv.Messages {
+				parsedMsg, err := client.ParseWebMessage(jid, wm.Message)
+				if err != nil {
+					logger.Warning("Failed to parse web message: " + err.Error())
+					continue
+				}
+				if parsedMsg.Message.GetConversation() != "" {
+					timestamp := parsedMsg.Info.Timestamp.Format("15:04")
+					sender := parsedMsg.Info.PushName
+					chatBuffers[jid] = append(chatBuffers[jid], fmt.Sprintf("[%s] %s: %s", timestamp, sender, parsedMsg.Message.GetConversation()))
+				}
+			}
+		}
 	}
 }
 
@@ -142,7 +169,7 @@ func main() {
 	}
 
 	clientLog := waLog.Stdout("Client", "ERROR", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
+	client = whatsmeow.NewClient(deviceStore, clientLog)
 	client.AddEventHandler(eventHandler)
 
 	if client.Store.ID == nil {
@@ -233,7 +260,6 @@ func main() {
 			logger.Fatal("TUI_START_ERROR", "Failed to start TUI:", err.Error())
 		}
 	}()
-	// Signal-Handling
 	<-c
 
 	fmt.Print("\033[100D")
@@ -252,20 +278,22 @@ func init() {
 // --------------------------------------------------------------------------------------------------------------------------------- TUI ---------------------------------------------------------------------------------------------
 
 var (
-	title               = "WhatsApp Kontakte & Gruppen"
 	titleStyle          = lipgloss.NewStyle()
 	itemStyle           = lipgloss.NewStyle()
 	selectedStyle       = lipgloss.NewStyle()
 	helpStyle           = lipgloss.NewStyle()
 	borderStyle         = lipgloss.NewStyle()
 	chatListBorderStyle = lipgloss.NewStyle()
+
+	helpText = "\n↑/↓ zum Navigieren • q zum Beenden"
 )
 
 type tuiModel struct {
-	cursor int
-	items  []string
-	width  int
-	height int
+	cursor   int
+	items    []string
+	width    int
+	height   int
+	messages []string
 }
 
 func UpdateLipglossStyles(m tuiModel) tuiModel {
@@ -289,7 +317,9 @@ func UpdateLipglossStyles(m tuiModel) tuiModel {
 	selectedStyle = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("229")).
 		Background(lipgloss.Color("57")).
-		Bold(true)
+		Bold(true).
+		Width(m.width/3 - (2*padHorizontal + 2)).
+		MaxWidth(m.width/3 - (2*padHorizontal + 2))
 
 	titleStyle = lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder()).
@@ -305,7 +335,9 @@ func UpdateLipglossStyles(m tuiModel) tuiModel {
 
 	chatListBorderStyle = lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("63"))
+		BorderForeground(lipgloss.Color("63")).
+		Height(m.height - (2*padVertical + titleHeight + 4 + titleMargin + 2)).
+		Width(m.width - (m.width/2 + (2 * padHorizontal) + 2))
 
 	return m
 }
@@ -315,11 +347,18 @@ func initialModel() tuiModel {
 	for _, chat := range chatlist {
 		entries = append(entries, chat.Name)
 	}
+
+	var initialMessages []string
+	if len(chatlist) > 0 {
+		initialMessages = chatBuffers[chatlist[0].JID]
+	}
+
 	return tuiModel{
-		cursor: 0,
-		items:  entries,
-		width:  0,
-		height: 0,
+		cursor:   0,
+		items:    entries,
+		messages: initialMessages,
+		width:    0,
+		height:   0,
 	}
 }
 
@@ -336,10 +375,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
+				m.messages = chatBuffers[chatlist[m.cursor].JID]
 			}
 		case "down", "j":
 			if m.cursor < len(m.items)-1 {
 				m.cursor++
+				m.messages = chatBuffers[chatlist[m.cursor].JID]
 			}
 		}
 	case tea.WindowSizeMsg:
@@ -352,8 +393,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) View() string {
-	content := titleStyle.Render(title) + "\n\n"
-
 	maxLines := m.height - 11
 	if maxLines < 1 {
 		maxLines = 1
@@ -388,14 +427,6 @@ func (m tuiModel) View() string {
 
 	displayItems := m.items[start:end]
 
-	// for i, item := range displayItems {
-	// 	if i == cursorInView {
-	// 		content += selectedStyle.Render("> "+item) + "\n"
-	// 	} else {
-	// 		content += itemStyle.Render("  "+item) + "\n"
-	// 	}
-	// }
-
 	listContent := ""
 	for i, item := range displayItems {
 		if i == cursorInView {
@@ -405,11 +436,17 @@ func (m tuiModel) View() string {
 		}
 	}
 
-	listContent += helpStyle.Render("\n↑/↓ zum Navigieren • q zum Beenden")
+	listContent += helpStyle.Render(helpText)
 
-	content = titleStyle.Render("WhatsApp Kontakte & Gruppen") + "\n\n"
+	chatListRendered := chatListBorderStyle.Render(listContent)
 
-	content += chatListBorderStyle.Render(listContent)
+	historyList := ""
+	for _, msg := range m.messages {
+		historyList += itemStyle.Render("  " + msg + "\n")
+	}
+	chatHistoryRendered := chatListBorderStyle.Render(historyList)
 
-	return borderStyle.Render(content)
+	sideBySide := lipgloss.JoinHorizontal(lipgloss.Top, chatListRendered, chatHistoryRendered)
+
+	return borderStyle.Render(titleStyle.Render("WhatsApp Kontakte & Gruppen") + "\n\n" + sideBySide)
 }
