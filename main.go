@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbletea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"go.mau.fi/whatsmeow"
@@ -33,23 +32,23 @@ import (
 
 var (
 	exitCodes = map[string]int{
-		"ERROR":                       -1,
-		"SUCCESS":                     0,
-		"SHUTDOWN":                    0,
-		"DB_INIT_ERROR":               10,
-		"DEVICE_STORE_ERROR":          11,
-		"LOGGER_ERROR":      	       12,
-		"QR_GENERATE_ERROR":           13,
-		"QR_OPEN_ERROR":               14,
-		"QR_DECODE_ERROR":             15,
-		"QR_RESIZE_ERROR":             16,
-		"QR_FILE_CREATE_ERROR":        17,
-		"QR_FILE_ENCODE_ERROR":        18,
-		"QR_RENDER_ERROR":             19,
-		"GROUP_FETCH_ERROR":           20,
-		"CONTACT_FETCH_ERROR":         21,
-		"DATA_MARSHAL_ERROR":          22,
-		"DATA_UNMARSHAL_ERROR":        23,
+		"ERROR":                -1,
+		"SUCCESS":              0,
+		"SHUTDOWN":             0,
+		"DB_INIT_ERROR":        10,
+		"DEVICE_STORE_ERROR":   11,
+		"LOGGER_ERROR":         12,
+		"QR_GENERATE_ERROR":    13,
+		"QR_OPEN_ERROR":        14,
+		"QR_DECODE_ERROR":      15,
+		"QR_RESIZE_ERROR":      16,
+		"QR_FILE_CREATE_ERROR": 17,
+		"QR_FILE_ENCODE_ERROR": 18,
+		"QR_RENDER_ERROR":      19,
+		"GROUP_FETCH_ERROR":    20,
+		"CONTACT_FETCH_ERROR":  21,
+		"DATA_MARSHAL_ERROR":   22,
+		"DATA_UNMARSHAL_ERROR": 23,
 	}
 
 	logger, _ = Logger.NewLogger(Logger.DEBUG, "./.log", false)
@@ -198,7 +197,11 @@ func main() {
 		}
 
 		for jid, contact := range contacts {
-			logger.Debug(fmt.Sprintf("%-20s - %s", jid, contact.PushName))
+			name := contact.FullName
+			if name == "" {
+				name = contact.PushName
+			}
+			logger.Debug(fmt.Sprintf("%-20s - %s", jid, name))
 			contactsList = append(contactsList, struct {
 				JID     types.JID
 				Contact types.ContactInfo
@@ -211,16 +214,26 @@ func main() {
 				Name string
 			}{
 				JID:  jid,
-				Name: contact.PushName,
+				Name: name,
 			})
 		}
+
+		sort.Slice(chatlist, func(i, j int) bool {
+			return chatlist[i].Name < chatlist[j].Name
+		})
+
+		logger.Info("WhatsApp Client started successfully.")
 	}
 
-	time.Sleep(1 * time.Second)
-
-	// Signal-Handling
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		p := tea.NewProgram(initialModel())
+		if err := p.Start(); err != nil {
+			logger.Fatal("TUI_START_ERROR", "Failed to start TUI:", err.Error())
+		}
+	}()
+	// Signal-Handling
 	<-c
 
 	fmt.Print("\033[100D")
@@ -234,4 +247,169 @@ func main() {
 
 func init() {
 	logger.ExitCodes = exitCodes
+}
+
+// --------------------------------------------------------------------------------------------------------------------------------- TUI ---------------------------------------------------------------------------------------------
+
+var (
+	title               = "WhatsApp Kontakte & Gruppen"
+	titleStyle          = lipgloss.NewStyle()
+	itemStyle           = lipgloss.NewStyle()
+	selectedStyle       = lipgloss.NewStyle()
+	helpStyle           = lipgloss.NewStyle()
+	borderStyle         = lipgloss.NewStyle()
+	chatListBorderStyle = lipgloss.NewStyle()
+)
+
+type tuiModel struct {
+	cursor int
+	items  []string
+	width  int
+	height int
+}
+
+func UpdateLipglossStyles(m tuiModel) tuiModel {
+	const (
+		padVertical   = 0
+		padHorizontal = 1
+		titleHeight   = 1
+		titleMargin   = 1
+	)
+
+	borderStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("63")).
+		Padding(padVertical, padHorizontal).
+		Width(m.width - (2 * padHorizontal)).
+		Height(m.height - (2*padVertical + titleHeight + 4 + titleMargin + 2))
+
+	itemStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241"))
+
+	selectedStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("229")).
+		Background(lipgloss.Color("57")).
+		Bold(true)
+
+	titleStyle = lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 2).
+		Align(lipgloss.Center).
+		Width(m.width - (2*padHorizontal + 4))
+
+	helpStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("240")).
+		Italic(true).
+		MarginTop(1)
+
+	chatListBorderStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("63"))
+
+	return m
+}
+
+func initialModel() tuiModel {
+	var entries []string
+	for _, chat := range chatlist {
+		entries = append(entries, chat.Name)
+	}
+	return tuiModel{
+		cursor: 0,
+		items:  entries,
+		width:  0,
+		height: 0,
+	}
+}
+
+func (m tuiModel) Init() tea.Cmd {
+	return tea.EnterAltScreen
+}
+
+func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.items)-1 {
+				m.cursor++
+			}
+		}
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m = UpdateLipglossStyles(m)
+
+	}
+	return m, nil
+}
+
+func (m tuiModel) View() string {
+	content := titleStyle.Render(title) + "\n\n"
+
+	maxLines := m.height - 11
+	if maxLines < 1 {
+		maxLines = 1
+	}
+	if maxLines > len(m.items) {
+		maxLines = len(m.items)
+	}
+
+	var start int
+	var cursorInView int
+
+	half := maxLines / 2
+	switch {
+	case m.cursor <= half:
+		start = 0
+		cursorInView = m.cursor
+	case m.cursor >= len(m.items)-half:
+		start = len(m.items) - maxLines
+		if start < 0 {
+			start = 0
+		}
+		cursorInView = m.cursor - start
+	default:
+		start = m.cursor - half
+		cursorInView = half
+	}
+
+	end := start + maxLines
+	if end > len(m.items) {
+		end = len(m.items)
+	}
+
+	displayItems := m.items[start:end]
+
+	// for i, item := range displayItems {
+	// 	if i == cursorInView {
+	// 		content += selectedStyle.Render("> "+item) + "\n"
+	// 	} else {
+	// 		content += itemStyle.Render("  "+item) + "\n"
+	// 	}
+	// }
+
+	listContent := ""
+	for i, item := range displayItems {
+		if i == cursorInView {
+			listContent += selectedStyle.Render("> "+item) + "\n"
+		} else {
+			listContent += itemStyle.Render("  "+item) + "\n"
+		}
+	}
+
+	listContent += helpStyle.Render("\n↑/↓ zum Navigieren • q zum Beenden")
+
+	content = titleStyle.Render("WhatsApp Kontakte & Gruppen") + "\n\n"
+
+	content += chatListBorderStyle.Render(listContent)
+
+	return borderStyle.Render(content)
 }
