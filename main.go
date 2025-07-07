@@ -285,7 +285,7 @@ var (
 	borderStyle         = lipgloss.NewStyle()
 	chatListBorderStyle = lipgloss.NewStyle()
 
-	helpText = "\n↑/↓ zum Navigieren • q zum Beenden"
+	helpText = "\n↑/↓ to navigate • q to quit"
 )
 
 type tuiModel struct {
@@ -448,5 +448,5 @@ func (m tuiModel) View() string {
 
 	sideBySide := lipgloss.JoinHorizontal(lipgloss.Top, chatListRendered, chatHistoryRendered)
 
-	return borderStyle.Render(titleStyle.Render("WhatsApp Kontakte & Gruppen") + "\n\n" + sideBySide)
+	return borderStyle.Render(titleStyle.Render("WhatsApp Contacts & Groups") + "\n\n" + sideBySide)
 }
