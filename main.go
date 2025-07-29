@@ -253,13 +253,18 @@ func main() {
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
 		p := tea.NewProgram(initialModel())
 		if err := p.Start(); err != nil {
 			logger.Fatal("TUI_START_ERROR", "Failed to start TUI:", err.Error())
 		}
+		close(done)
 	}()
-	<-c
+	select {
+	case <-c:
+	case <-done:
+	}
 
 	fmt.Print("\033[100D")
 	fmt.Print("\033[2K")
