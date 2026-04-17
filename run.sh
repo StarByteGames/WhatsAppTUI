@@ -51,7 +51,7 @@ install_deps() {
 
 build() {
     echo ":: Building $BINARY..."
-    go build -o "$BINARY" .
+    go build -o "$BINARY" ./cmd/whatsapp-tui
     echo ":: Build complete."
 }
 
