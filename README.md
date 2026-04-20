@@ -1,4 +1,4 @@
-# WhatsApp TUI 0.1.0
+# WhatsApp TUI 0.1.1
 
 WhatsApp in your terminal — no browser, no Electron, no bloat.
 
