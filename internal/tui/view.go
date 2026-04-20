@@ -57,7 +57,7 @@ func (m Model) View() string {
 	if m.focus == focusChatList {
 		chatBorder = sActive
 	}
-	chatBox := chatBorder.Width(chatInner).Height(innerH).Render(chatContent)
+	chatBox := chatBorder.Width(chatInner).MaxWidth(chatInner + 2).Height(innerH).Render(chatContent)
 
 	// ── Message panel ─────────────────────────────────────────────────────────
 	msgContent := m.renderMessages(msgInner, innerH)
@@ -65,7 +65,7 @@ func (m Model) View() string {
 	if m.focus == focusMessages {
 		msgBorder = sActive
 	}
-	msgBox := msgBorder.Width(msgInner).Height(innerH).Render(msgContent)
+	msgBox := msgBorder.Width(msgInner).MaxWidth(msgInner + 2).Height(innerH).Render(msgContent)
 
 	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, chatBox, msgBox)
 
@@ -115,7 +115,7 @@ func (m Model) renderChatList(w, h int) string {
 		lines = append(lines, sMuted.Render("No chats yet – waiting for messages…"))
 	}
 
-	return strings.Join(lines, "\n")
+	return clampContent(strings.Join(lines, "\n"), w)
 }
 
 // ── Message panel rendering ───────────────────────────────────────────────────
@@ -170,7 +170,7 @@ func (m Model) renderMessages(w, h int) string {
 		visible = []string{sMuted.Render("No messages yet. Type below and press Enter.")}
 	}
 
-	return strings.Join(append(header, visible...), "\n")
+	return clampContent(strings.Join(append(header, visible...), "\n"), w)
 }
 
 func (m Model) formatMsg(msg apptypes.Message, w int) []string {
@@ -179,15 +179,15 @@ func (m Model) formatMsg(msg apptypes.Message, w int) []string {
 
 	if msg.FromMe {
 		meta := sTime.Render("You · ") + ts
-		lines = append(lines, "  "+meta)
-		for _, l := range wordWrap(msg.Content, w-4) {
-			lines = append(lines, "  "+sMyMsg.Render(l))
+		lines = append(lines, clampWidth("  "+meta, w))
+		for _, l := range wordWrap(msg.Content, w-6) {
+			lines = append(lines, clampWidth("  "+sMyMsg.Render(l), w))
 		}
 	} else {
 		meta := sSender.Render(msg.Sender) + "  " + ts
-		lines = append(lines, meta)
+		lines = append(lines, clampWidth(meta, w))
 		for _, l := range wordWrap(msg.Content, w-4) {
-			lines = append(lines, sTheirMsg.Render(l))
+			lines = append(lines, clampWidth(sTheirMsg.Render(l), w))
 		}
 	}
 
@@ -416,24 +416,47 @@ func truncateStr(s string, maxW int) string {
 	return string(r[:maxW-1]) + "…"
 }
 
-// wordWrap splits text into lines of at most width runes, breaking at spaces.
+// wordWrap splits text into lines of at most width display columns, breaking at spaces.
+// It handles embedded newlines by splitting on them first.
 func wordWrap(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	// Handle embedded newlines.
+	var result []string
+	for _, paragraph := range strings.Split(text, "\n") {
+		result = append(result, wrapLine(paragraph, width)...)
+	}
+	return result
+}
+
+// wrapLine wraps a single line (no embedded newlines) to the given display width.
+func wrapLine(text string, width int) []string {
 	if width <= 0 {
 		return []string{text}
 	}
 	var result []string
 	r := []rune(text)
 	for len(r) > 0 {
-		if len(r) <= width {
+		if lipgloss.Width(string(r)) <= width {
 			result = append(result, string(r))
 			break
 		}
-		cut := width
-		for cut > 0 && r[cut-1] != ' ' {
-			cut--
+		// Find the cut point where display width fits.
+		cut := 0
+		for cut < len(r) && lipgloss.Width(string(r[:cut+1])) <= width {
+			cut++
 		}
 		if cut == 0 {
-			cut = width
+			cut = 1 // always consume at least one rune
+		}
+		// Try to break at a space.
+		spaceCut := cut
+		for spaceCut > 0 && r[spaceCut-1] != ' ' {
+			spaceCut--
+		}
+		if spaceCut > 0 {
+			cut = spaceCut
 		}
 		result = append(result, string(r[:cut]))
 		r = r[cut:]
@@ -441,7 +464,27 @@ func wordWrap(text string, width int) []string {
 			r = r[1:]
 		}
 	}
+	if len(result) == 0 {
+		result = []string{""}
+	}
 	return result
+}
+
+// clampWidth truncates a (possibly styled/ANSI) string to at most maxW display columns.
+func clampWidth(s string, maxW int) string {
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	return lipgloss.NewStyle().MaxWidth(maxW).Render(s)
+}
+
+// clampContent truncates every line in content to maxW display columns.
+func clampContent(content string, maxW int) string {
+	lines := strings.Split(content, "\n")
+	for i, l := range lines {
+		lines[i] = clampWidth(l, maxW)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // orDefault returns s if non-empty, otherwise def.
