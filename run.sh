@@ -8,6 +8,7 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --install <distro>  Install dependencies (arch, debian, fedora, opensuse)"
+    echo "  --build             Build the binary without running"
     echo "  --run               Run the app (builds automatically if needed)"
     echo "  --logout            Remove session data and log out"
     echo ""
@@ -16,6 +17,7 @@ usage() {
     echo "  $0 --install debian"
     echo "  $0 --run"
     echo "  $0 --logout"
+    echo "  $0 --build"
     echo "  $0 --install arch --run"
     exit 1
 }
@@ -78,6 +80,10 @@ while [ $# -gt 0 ]; do
             [ $# -lt 2 ] && { echo "Error: --install requires a distro name"; exit 1; }
             install_deps "$2"
             shift 2
+            ;;
+        --build)
+            build
+            shift
             ;;
         --run)
             run
