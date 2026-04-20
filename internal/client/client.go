@@ -436,8 +436,9 @@ func downloadAndCacheImage(s *state.AppState, imgMsg *waE2E.ImageMessage) string
 		return ""
 	}
 
-	// Resize to max 40 columns wide (~320px at typical 8px cell width).
-	const maxW = 320
+	// Resize to a reasonable max width – keep enough detail for sharp
+	// terminal rendering (chafa / half-block) without storing huge files.
+	const maxW = 800
 	if img.Bounds().Dx() > maxW {
 		img = resize.Resize(maxW, 0, img, resize.Lanczos3)
 	}
@@ -448,7 +449,7 @@ func downloadAndCacheImage(s *state.AppState, imgMsg *waE2E.ImageMessage) string
 		return ""
 	}
 	defer f.Close()
-	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 85}); err != nil {
+	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 92}); err != nil {
 		s.Logger.Warning("Failed to encode JPEG: " + err.Error())
 		os.Remove(fpath)
 		return ""

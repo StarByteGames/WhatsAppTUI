@@ -215,7 +215,7 @@ func renderImageBlock(imgPath string, maxCols int) []string {
 		return cached.([]string)
 	}
 
-	lines := renderImageWithChafa(imgPath, maxCols)
+	lines := renderImageWithChafa(imgPath)
 	if lines == nil {
 		lines = renderImageHalfBlock(imgPath, maxCols)
 	}
@@ -228,13 +228,12 @@ func renderImageBlock(imgPath string, maxCols int) []string {
 
 // renderImageWithChafa shells out to chafa(1) for high-quality terminal
 // image rendering.  Returns nil if chafa is not installed.
-func renderImageWithChafa(imgPath string, maxCols int) []string {
-	cols := maxCols
-	rows := cols * 3 / 8 // roughly 3:8 aspect for compact look
+func renderImageWithChafa(imgPath string) []string {
 	cmd := exec.Command("chafa",
 		"--format", "symbols",
 		"--symbols", "all",
-		"--size", fmt.Sprintf("%dx%d", cols, rows),
+		"--colors", "full",
+		"--color-space", "din99d",
 		imgPath,
 	)
 	out, err := cmd.Output()
@@ -262,10 +261,10 @@ func renderImageHalfBlock(imgPath string, maxCols int) []string {
 		return nil
 	}
 
-	// Resize to fit the panel width (compact: max 40 cols).
+	// Resize to fit the panel width.
 	targetW := maxCols
-	if targetW > 40 {
-		targetW = 40
+	if targetW > 80 {
+		targetW = 80
 	}
 	if targetW < 10 {
 		targetW = 10
