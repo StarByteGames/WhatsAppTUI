@@ -63,6 +63,7 @@ func NewModel(s *state.AppState, chats []apptypes.ChatItem) Model {
 		state:    s,
 		chats:    chats,
 		messages: msgs,
+		msgScroll: -1,
 	}
 }
 
@@ -125,7 +126,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messages[msg.chatJID] = mergeMessages(m.messages[msg.chatJID], msg.msgs)
 		if m.selectedChat >= 0 && m.selectedChat < len(m.chats) &&
 			m.chats[m.selectedChat].JID.String() == msg.chatJID {
-			m.msgScroll = m.maxMsgScroll(msg.chatJID)
+			m.msgScroll = -1
 		}
 		return m, nil
 
@@ -196,10 +197,10 @@ func (m Model) applyNewMsg(evt apptypes.MsgEvent) Model {
 		m.chats = append(m.chats, newChat)
 	}
 
-	// Auto-scroll messages if this chat is open.
+	// Auto-scroll to bottom if this chat is open.
 	if m.selectedChat >= 0 && m.selectedChat < len(m.chats) &&
 		m.chats[m.selectedChat].JID.String() == key {
-		m.msgScroll = m.maxMsgScroll(key)
+		m.msgScroll = -1
 	}
 
 	return m
@@ -277,7 +278,7 @@ func (m Model) keyChatList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "j", "down":
 		if m.selectedChat < len(m.chats)-1 {
 			m.selectedChat++
-			m.msgScroll = 0
+			m.msgScroll = -1
 			vis := m.visibleChatRows()
 			if m.selectedChat >= m.chatScroll+vis {
 				m.chatScroll = m.selectedChat - vis + 1
@@ -287,7 +288,7 @@ func (m Model) keyChatList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "k", "up":
 		if m.selectedChat > 0 {
 			m.selectedChat--
-			m.msgScroll = 0
+			m.msgScroll = -1
 			if m.selectedChat < m.chatScroll {
 				m.chatScroll = m.selectedChat
 			}
@@ -298,7 +299,7 @@ func (m Model) keyChatList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusInput
 			m.chats[m.selectedChat].Unread = 0
 			key := m.chats[m.selectedChat].JID.String()
-			m.msgScroll = m.maxMsgScroll(key)
+			m.msgScroll = -1
 			return m, m.loadChatMsgs(key)
 		}
 
@@ -338,9 +339,7 @@ func (m Model) keyMessages(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.msgScroll = 0
 
 	case "G":
-		if m.selectedChat >= 0 && m.selectedChat < len(m.chats) {
-			m.msgScroll = m.maxMsgScroll(m.chats[m.selectedChat].JID.String())
-		}
+		m.msgScroll = -1
 	}
 	return m, nil
 }
