@@ -157,9 +157,15 @@ func (m Model) renderMessages(w, h int) string {
 		visH = 1
 	}
 	total := len(msgLines)
-	offset := m.msgScroll
-	if offset+visH > total {
+	var offset int
+	if m.msgScroll < 0 {
+		// Negative scroll means "stick to bottom".
 		offset = max(0, total-visH)
+	} else {
+		offset = m.msgScroll
+		if offset+visH > total {
+			offset = max(0, total-visH)
+		}
 	}
 
 	var visible []string
