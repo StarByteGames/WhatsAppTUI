@@ -87,7 +87,7 @@ func (m Model) View() string {
 
 func (m Model) renderChatList(w, h int) string {
 	title := sAccent.Bold(true).Render("Chats")
-	divider := sTime.Render(strings.Repeat("─", w))
+	divider := sDivider.Render(strings.Repeat("─", w))
 	lines := []string{title, divider}
 
 	visRows := h - 2
@@ -132,7 +132,7 @@ func (m Model) renderMessages(w, h int) string {
 	}
 
 	title := sAccent.Bold(true).Render(orDefault(chatName, "Select a chat"))
-	divider := sTime.Render(strings.Repeat("─", w))
+	divider := sDivider.Render(strings.Repeat("─", w))
 	header := []string{title, divider}
 
 	if key == "" {
@@ -147,7 +147,20 @@ func (m Model) renderMessages(w, h int) string {
 	m.state.MessagesMu.RUnlock()
 
 	var msgLines []string
+	var lastDate string
 	for _, msg := range msgs {
+		// Insert date separator when the day changes.
+		dateStr := msg.Timestamp.Format("Jan 2, 2006")
+		if dateStr != lastDate {
+			lastDate = dateStr
+			label := sDateBadge.Render("── " + dateStr + " ──")
+			pad := (w - lipgloss.Width(label)) / 2
+			if pad < 0 {
+				pad = 0
+			}
+			msgLines = append(msgLines, strings.Repeat(" ", pad)+label)
+			msgLines = append(msgLines, "")
+		}
 		msgLines = append(msgLines, m.formatMsg(msg, w)...)
 		msgLines = append(msgLines, "") // blank separator
 	}
@@ -184,10 +197,23 @@ func (m Model) formatMsg(msg apptypes.Message, w int) []string {
 	var lines []string
 
 	if msg.FromMe {
-		meta := sTime.Render("You · ") + ts
-		lines = append(lines, clampWidth("  "+meta, w))
-		for _, l := range wordWrap(msg.Content, w-6) {
-			lines = append(lines, clampWidth("  "+sMyMsg.Render(l), w))
+		meta := sTime.Render("You") + "  " + ts
+		wrapped := wordWrap(msg.Content, w-6)
+		// Right-align: pad lines to push them to the right.
+		for i, l := range wrapped {
+			styled := sMyMsg.Render(l)
+			pad := w - lipgloss.Width(styled) - 1
+			if pad < 0 {
+				pad = 0
+			}
+			if i == 0 {
+				metaPad := w - lipgloss.Width(meta) - 1
+				if metaPad < 0 {
+					metaPad = 0
+				}
+				lines = append(lines, strings.Repeat(" ", metaPad)+meta)
+			}
+			lines = append(lines, strings.Repeat(" ", pad)+styled)
 		}
 	} else {
 		meta := sSender.Render(msg.Sender) + "  " + ts

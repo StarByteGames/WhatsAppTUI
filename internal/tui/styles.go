@@ -5,13 +5,15 @@ import "github.com/charmbracelet/lipgloss"
 // ── Colour palette (WhatsApp dark theme) ─────────────────────────────────────
 
 var (
-	clrGreen   = lipgloss.Color("#25D366")
-	clrPanel   = lipgloss.Color("#1F2C34")
-	clrBorder  = lipgloss.Color("#374045")
-	clrText    = lipgloss.Color("#E9EDEF")
-	clrMuted   = lipgloss.Color("#8696A0")
-	clrMyBg    = lipgloss.Color("#005C4B")
-	clrTheirBg = lipgloss.Color("#1F2C34")
+	clrGreen    = lipgloss.Color("#25D366")
+	clrPanel    = lipgloss.Color("#111B21")
+	clrBorder   = lipgloss.Color("#2A3942")
+	clrText     = lipgloss.Color("#E9EDEF")
+	clrMuted    = lipgloss.Color("#8696A0")
+	clrMyBg     = lipgloss.Color("#005C4B")
+	clrTheirBg  = lipgloss.Color("#202C33")
+	clrHeaderBg = lipgloss.Color("#202C33")
+	clrUnread   = lipgloss.Color("#00A884")
 )
 
 // ── Lipgloss styles ───────────────────────────────────────────────────────────
@@ -27,7 +29,7 @@ var (
 
 	sHeader = lipgloss.NewStyle().
 		Bold(true).
-		Background(clrPanel).
+		Background(clrHeaderBg).
 		Foreground(clrGreen).
 		PaddingLeft(1).
 		PaddingRight(1)
@@ -45,7 +47,7 @@ var (
 			PaddingRight(1)
 
 	sUnread = lipgloss.NewStyle().
-		Foreground(clrGreen).
+		Foreground(clrUnread).
 		Bold(true)
 
 	sSender = lipgloss.NewStyle().
@@ -68,7 +70,7 @@ var (
 			PaddingRight(1)
 
 	sStatus = lipgloss.NewStyle().
-		Background(clrPanel).
+		Background(clrHeaderBg).
 		Foreground(clrMuted)
 
 	sMuted = lipgloss.NewStyle().
@@ -77,4 +79,11 @@ var (
 
 	sAccent = lipgloss.NewStyle().
 		Foreground(clrGreen)
+
+	sDivider = lipgloss.NewStyle().
+			Foreground(clrBorder)
+
+	sDateBadge = lipgloss.NewStyle().
+			Foreground(clrMuted).
+			Bold(true)
 )
