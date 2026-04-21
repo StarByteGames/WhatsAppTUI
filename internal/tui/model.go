@@ -45,6 +45,10 @@ type Model struct {
 	inputText   string
 	inputCursor int // rune index
 
+	// Sync status.
+	syncCount int
+	syncDone  bool
+
 	// Temporary status flash.
 	statusMsg  string
 	statusTime time.Time
@@ -77,6 +81,7 @@ type tuiLoadedMsgs struct {
 }
 type tuiStatus string
 type tuiError struct{ err error }
+type tuiSyncCheck int // carries the syncCount at schedule time
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
@@ -120,7 +125,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tuiHistoryRefresh:
-		return m.rebuildFromGlobal(), m.listenForHistory()
+		m.syncCount++
+		m.syncDone = false
+		snapshot := m.syncCount
+		return m.rebuildFromGlobal(), tea.Batch(
+			m.listenForHistory(),
+			tea.Tick(8*time.Second, func(time.Time) tea.Msg { return tuiSyncCheck(snapshot) }),
+		)
 
 	case tuiLoadedMsgs:
 		m.messages[msg.chatJID] = mergeMessages(m.messages[msg.chatJID], msg.msgs)
@@ -141,6 +152,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tuiError:
 		m.statusMsg = "Error: " + msg.err.Error()
 		m.statusTime = time.Now()
+		return m, nil
+
+	case tuiSyncCheck:
+		if int(msg) == m.syncCount {
+			m.syncDone = true
+		}
 		return m, nil
 
 	case tea.KeyMsg:
