@@ -173,7 +173,7 @@ func extractHistoryMessage(s *state.AppState, wmi *waWeb.WebMessageInfo, chatJID
 		}
 	}
 
-	return &apptypes.Message{
+	msg := &apptypes.Message{
 		ID:        key.GetID(),
 		Sender:    senderName,
 		SenderJID: senderJID,
@@ -181,6 +181,15 @@ func extractHistoryMessage(s *state.AppState, wmi *waWeb.WebMessageInfo, chatJID
 		Timestamp: time.Unix(int64(wmi.GetMessageTimestamp()), 0),
 		FromMe:    key.GetFromMe(),
 	}
+
+	// Try to download and cache image if this is an image message.
+	if imgMsg := getImageMessage(m); imgMsg != nil {
+		if cached := downloadAndCacheImage(s, imgMsg); cached != "" {
+			msg.ImagePath = cached
+		}
+	}
+
+	return msg
 }
 
 func handleMessage(s *state.AppState, evt *events.Message) {
