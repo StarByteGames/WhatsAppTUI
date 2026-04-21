@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/nfnt/resize"
@@ -46,9 +47,45 @@ func NewEventHandler(s *state.AppState) func(interface{}) {
 }
 
 func handleHistorySync(s *state.AppState, evt *events.HistorySync) {
-	for _, conv := range evt.Data.GetConversations() {
-		processHistoryConversation(s, conv)
+	// Build a map of push names delivered with this sync batch so we can
+	// use them as fallback when the contact store is not yet populated.
+	pushNames := make(map[string]string, len(evt.Data.GetPushnames()))
+	for _, pn := range evt.Data.GetPushnames() {
+		id := pn.GetID()
+		name := pn.GetPushname()
+		if id == "" || name == "" || looksLikeNumber(name) {
+			continue
+		}
+		// Strip server suffix so we can look up by jid.User.
+		if idx := strings.IndexByte(id, '@'); idx > 0 {
+			id = id[:idx]
+		}
+		pushNames[id] = name
 	}
+
+	for _, conv := range evt.Data.GetConversations() {
+		processHistoryConversation(s, conv, pushNames)
+	}
+
+	// After processing all conversations, sweep chats that still have a
+	// phone number as name and try to resolve them now that the contact
+	// store / message history may have more data.
+	ctx := context.Background()
+	s.ChatsMu.Lock()
+	for key, c := range s.ChatsMap {
+		if !c.IsGroup && looksLikeNumber(c.Name) {
+			resolved := resolveContactName(s, ctx, c.JID)
+			if resolved == "" {
+				resolved = pushNames[c.JID.User]
+			}
+			if resolved != "" {
+				c.Name = resolved
+				s.DB.UpsertChat(key, c.Name, c.IsGroup, c.LastMsg, c.LastTime)
+			}
+		}
+	}
+	s.ChatsMu.Unlock()
+
 	// Signal the TUI to rebuild its chat list from the updated global maps.
 	select {
 	case s.HistoryCh <- struct{}{}:
@@ -56,7 +93,7 @@ func handleHistorySync(s *state.AppState, evt *events.HistorySync) {
 	}
 }
 
-func processHistoryConversation(s *state.AppState, conv *waHistorySync.Conversation) {
+func processHistoryConversation(s *state.AppState, conv *waHistorySync.Conversation, pushNames map[string]string) {
 	jid, err := types.ParseJID(conv.GetID())
 	if err != nil {
 		s.Logger.Warning("Failed to parse history conversation JID: " + conv.GetID())
@@ -103,6 +140,29 @@ func processHistoryConversation(s *state.AppState, conv *waHistorySync.Conversat
 	name := conv.GetName()
 	if name == "" {
 		name = jid.User
+	}
+	// For non-group chats, prefer the contact-store name (the name the user
+	// saved) over the push name that came from history sync.
+	if jid.Server != types.GroupServer {
+		if resolved := resolveContactName(s, context.Background(), jid); resolved != "" {
+			name = resolved
+		}
+	}
+	// If still a phone number, try to extract a push name from the history
+	// messages we just processed (the sender name of incoming messages).
+	if looksLikeNumber(name) && jid.Server != types.GroupServer {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if !msgs[i].FromMe && !looksLikeNumber(msgs[i].Sender) {
+				name = msgs[i].Sender
+				break
+			}
+		}
+	}
+	// Last resort: use the push name map delivered with this sync batch.
+	if looksLikeNumber(name) && jid.Server != types.GroupServer {
+		if pn, ok := pushNames[jid.User]; ok && pn != "" {
+			name = pn
+		}
 	}
 
 	var lastMsg string
@@ -216,15 +276,23 @@ func handleMessage(s *state.AppState, evt *events.Message) {
 		if !msg.FromMe {
 			chat.Unread++
 		}
+		// If the chat still shows a phone number, update with the push name
+		// from this message (= the name the user set in their profile).
+		if looksLikeNumber(chat.Name) && evt.Info.PushName != "" {
+			chat.Name = evt.Info.PushName
+		}
 		chatName = chat.Name
 	} else {
-		name := evt.Info.PushName
+		// Prefer the contact-store name over the push name.
+		name := ""
+		if chatJID.Server != types.GroupServer {
+			name = resolveContactName(s, context.Background(), chatJID)
+		}
 		if name == "" {
-			if resolved := resolveContactName(s, context.Background(), chatJID); resolved != "" {
-				name = resolved
-			} else {
-				name = chatJID.User
-			}
+			name = evt.Info.PushName
+		}
+		if name == "" {
+			name = chatJID.User
 		}
 		s.ChatsMap[key] = &apptypes.ChatItem{
 			JID:      chatJID,
@@ -544,11 +612,17 @@ func LoadChats(s *state.AppState, ctx context.Context) ([]apptypes.ChatItem, err
 	result := make([]apptypes.ChatItem, 0, len(byJID))
 	s.ChatsMu.Lock()
 	for key, c := range byJID {
-		// Resolve names still showing as raw phone numbers.
-		if looksLikeNumber(c.Name) && !c.IsGroup {
+		// For non-group chats, always prefer the contact-store name
+		// (the name the user saved) over push names or phone numbers.
+		if !c.IsGroup {
 			if resolved := resolveContactName(s, ctx, c.JID); resolved != "" {
 				c.Name = resolved
 			}
+		}
+		// Persist the resolved name back to the DB so stale phone-number entries
+		// get corrected for subsequent starts.
+		if !looksLikeNumber(c.Name) {
+			s.DB.UpsertChat(key, c.Name, c.IsGroup, c.LastMsg, c.LastTime)
 		}
 		result = append(result, *c)
 		s.ChatsMap[key] = c
