@@ -359,12 +359,23 @@ func (m Model) renderInput(totalW int) string {
 
 func (m Model) renderStatus() string {
 	conn := sAccent.Render("● Connected")
+
+	// Sync indicator.
+	var syncStatus string
+	if m.syncDone {
+		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrGreen).Render("Synced ✓")
+	} else if m.syncCount > 0 {
+		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrMuted).Render(fmt.Sprintf("Syncing… (%d)", m.syncCount))
+	} else {
+		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrMuted).Render("Syncing…")
+	}
+
 	flash := ""
 	if m.statusMsg != "" && time.Since(m.statusTime) < 4*time.Second {
 		flash = "   " + lipgloss.NewStyle().Foreground(clrText).Render(m.statusMsg)
 	}
 	keys := sTime.Render("  j/k navigate · g/G top/bottom · i type · q quit")
-	return sStatus.Width(m.width).Render(conn + flash + keys)
+	return sStatus.Width(m.width).Render(conn + syncStatus + flash + keys)
 }
 
 // ── Dimension helpers ─────────────────────────────────────────────────────────
