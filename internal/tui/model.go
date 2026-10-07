@@ -1,13 +1,11 @@
 package tui
 
 import (
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"go.mau.fi/whatsmeow/types"
 
 	"DevStarByte/internal/client"
 	"DevStarByte/internal/state"
@@ -22,24 +20,28 @@ const (
 	focusChatList focusArea = iota
 	focusMessages
 	focusInput
+	focusSearch
 )
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
-// Model is the bubbletea application model.
+// Model is the bubbletea application model. Messages are not copied into the
+// model: they are read from the shared state when rendering.
 type Model struct {
 	state         *state.AppState
 	width, height int
 	focus         focusArea
 
-	// Chat list state.
+	// Chat list state: a sorted snapshot of the shared chat map, filtered by
+	// the search query.
 	chats        []apptypes.ChatItem
 	chatScroll   int
 	selectedChat int
+	search       string
 
-	// Message state.
-	messages  map[string][]apptypes.Message
+	// Message panel state. msgScroll < 0 means "stick to the bottom".
 	msgScroll int
+	showEdits bool
 
 	// Text input state.
 	inputText   string
@@ -55,30 +57,18 @@ type Model struct {
 }
 
 // NewModel creates an initialised Model.
-func NewModel(s *state.AppState, chats []apptypes.ChatItem) Model {
-	msgs := make(map[string][]apptypes.Message)
-	s.MessagesMu.RLock()
-	for k, v := range s.MessagesMap {
-		msgs[k] = append([]apptypes.Message{}, v...)
-	}
-	s.MessagesMu.RUnlock()
-
+func NewModel(s *state.AppState) Model {
 	return Model{
-		state:    s,
-		chats:    chats,
-		messages: msgs,
+		state:     s,
+		chats:     s.ChatList(),
 		msgScroll: -1,
 	}
 }
 
 // ── Tea message types ─────────────────────────────────────────────────────────
 
-type tuiNewMsg apptypes.MsgEvent
-type tuiHistoryRefresh struct{}
-type tuiLoadedMsgs struct {
-	chatJID string
-	msgs    []apptypes.Message
-}
+type tuiUpdate struct{}
+type tuiHistorySync struct{}
 type tuiStatus string
 type tuiError struct{ err error }
 type tuiSyncCheck int // carries the syncCount at schedule time
@@ -86,33 +76,24 @@ type tuiSyncCheck int // carries the syncCount at schedule time
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.listenForMsg(), m.listenForHistory())
+	return tea.Batch(m.listenForUpdates(), m.listenForHistory())
 }
 
-// loadChatMsgs fetches persisted messages for a chat from SQLite.
-func (m Model) loadChatMsgs(chatJID string) tea.Cmd {
-	store := m.state.DB
+// listenForUpdates blocks until the shared state changes.
+func (m Model) listenForUpdates() tea.Cmd {
+	ch := m.state.UpdateCh
 	return func() tea.Msg {
-		return tuiLoadedMsgs{chatJID: chatJID, msgs: store.LoadMessages(chatJID, 500)}
+		<-ch
+		return tuiUpdate{}
 	}
 }
 
-// listenForHistory blocks until a history sync signal arrives, then delivers
-// a tuiHistoryRefresh so the model can rebuild chats and messages from global state.
+// listenForHistory blocks until a history sync batch was processed.
 func (m Model) listenForHistory() tea.Cmd {
 	ch := m.state.HistoryCh
 	return func() tea.Msg {
 		<-ch
-		return tuiHistoryRefresh{}
-	}
-}
-
-// listenForMsg blocks until a message arrives on incomingCh, then delivers it
-// as a tuiNewMsg so the Update loop can process it.
-func (m Model) listenForMsg() tea.Cmd {
-	ch := m.state.IncomingCh
-	return func() tea.Msg {
-		return tuiNewMsg(<-ch)
+		return tuiHistorySync{}
 	}
 }
 
@@ -122,43 +103,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.ensureChatVisible()
 		return m, nil
 
-	case tuiHistoryRefresh:
+	case tuiUpdate:
+		return m.refreshChats(), m.listenForUpdates()
+
+	case tuiHistorySync:
+		// History arrives in batches; consider the sync done once no new
+		// batch arrived for a while.
 		m.syncCount++
 		m.syncDone = false
 		snapshot := m.syncCount
-		return m.rebuildFromGlobal(), tea.Batch(
+		return m, tea.Batch(
 			m.listenForHistory(),
 			tea.Tick(8*time.Second, func(time.Time) tea.Msg { return tuiSyncCheck(snapshot) }),
 		)
-
-	case tuiLoadedMsgs:
-		m.messages[msg.chatJID] = mergeMessages(m.messages[msg.chatJID], msg.msgs)
-		if m.selectedChat >= 0 && m.selectedChat < len(m.chats) &&
-			m.chats[m.selectedChat].JID.String() == msg.chatJID {
-			m.msgScroll = -1
-		}
-		return m, nil
-
-	case tuiNewMsg:
-		return m.applyNewMsg(apptypes.MsgEvent(msg)), m.listenForMsg()
-
-	case tuiStatus:
-		m.statusMsg = string(msg)
-		m.statusTime = time.Now()
-		return m, nil
-
-	case tuiError:
-		m.statusMsg = "Error: " + msg.err.Error()
-		m.statusTime = time.Now()
-		return m, nil
 
 	case tuiSyncCheck:
 		if int(msg) == m.syncCount {
 			m.syncDone = true
 		}
 		return m, nil
+
+	case tuiStatus:
+		return m.flash(string(msg)), nil
+
+	case tuiError:
+		return m.flash("Error: " + msg.err.Error()), nil
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg), nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -167,116 +142,152 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) applyNewMsg(evt apptypes.MsgEvent) Model {
-	// Also pull in any new messages that may have been added to the global map
-	// by the history sync handler concurrently.
-	m = m.rebuildMessages()
-	key := evt.ChatJID.String()
-	m.messages[key] = append(m.messages[key], evt.Message)
+func (m Model) flash(text string) Model {
+	m.statusMsg = text
+	m.statusTime = time.Now()
+	return m
+}
 
-	found := false
-	for i := range m.chats {
-		if m.chats[i].JID.String() == key {
-			found = true
-			m.chats[i].LastMsg = evt.Message.Content
-			m.chats[i].LastTime = evt.Message.Timestamp
-			if !evt.Message.FromMe {
-				m.chats[i].Unread++
-			}
+// selectedKey returns the JID string of the selected chat, or "".
+func (m Model) selectedKey() string {
+	if m.selectedChat >= 0 && m.selectedChat < len(m.chats) {
+		return m.chats[m.selectedChat].JID.String()
+	}
+	return ""
+}
+
+// refreshChats re-reads the chat list from the shared state and applies the
+// search filter, keeping the selection on the same chat even if the order
+// changed.
+func (m Model) refreshChats() Model {
+	selected := m.selectedKey()
+	m.chats = filterChats(m.state.ChatList(), m.search)
+	m.selectedChat = min(m.selectedChat, max(0, len(m.chats)-1))
+	for i, c := range m.chats {
+		if c.JID.String() == selected {
+			m.selectedChat = i
 			break
 		}
 	}
-
-	if !found {
-		// New conversation – look it up in the global map.
-		m.state.ChatsMu.RLock()
-		var name string
-		var isGroup bool
-		if chat, ok := m.state.ChatsMap[key]; ok {
-			name = chat.Name
-			isGroup = chat.IsGroup
-		} else {
-			name = evt.ChatJID.User
-			isGroup = evt.ChatJID.Server == types.GroupServer
-		}
-		m.state.ChatsMu.RUnlock()
-
-		newChat := apptypes.ChatItem{
-			JID:      evt.ChatJID,
-			Name:     name,
-			LastMsg:  evt.Message.Content,
-			LastTime: evt.Message.Timestamp,
-			IsGroup:  isGroup,
-		}
-		if !evt.Message.FromMe {
-			newChat.Unread = 1
-		}
-		m.chats = append(m.chats, newChat)
+	m.ensureChatVisible()
+	if m.focus == focusMessages || m.focus == focusInput {
+		m = m.markSelectedRead()
 	}
-
-	// Auto-scroll to bottom if this chat is open.
-	if m.selectedChat >= 0 && m.selectedChat < len(m.chats) &&
-		m.chats[m.selectedChat].JID.String() == key {
-		m.msgScroll = -1
-	}
-
 	return m
+}
+
+// filterChats keeps the chats whose display name or number contains every
+// word of the query (case-insensitive).
+func filterChats(chats []apptypes.ChatItem, query string) []apptypes.ChatItem {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return chats
+	}
+	out := chats[:0:0]
+	for _, c := range chats {
+		haystack := strings.ToLower(displayName(c) + " " + c.Name + " " + c.JID.User)
+		match := true
+		for _, t := range terms {
+			if !strings.Contains(haystack, t) {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// setSearch changes the search query and re-filters the chat list, selecting
+// the best (first) match.
+func (m Model) setSearch(query string) Model {
+	m.search = query
+	m.selectedChat = 0
+	m.chatScroll = 0
+	m.msgScroll = -1
+	m.chats = filterChats(m.state.ChatList(), query)
+	return m
+}
+
+// markSelectedRead clears the unread counter of the open chat.
+func (m Model) markSelectedRead() Model {
+	if key := m.selectedKey(); key != "" {
+		m.state.MarkRead(key)
+		m.chats[m.selectedChat].Unread = 0
+	}
+	return m
+}
+
+// ensureChatVisible scrolls the chat list so the selection is on screen.
+func (m *Model) ensureChatVisible() {
+	vis := m.layout().chatRows
+	if m.selectedChat < m.chatScroll {
+		m.chatScroll = m.selectedChat
+	} else if m.selectedChat >= m.chatScroll+vis {
+		m.chatScroll = m.selectedChat - vis + 1
+	}
+	m.chatScroll = max(0, min(m.chatScroll, len(m.chats)-vis))
+}
+
+func (m Model) selectChat(i int) Model {
+	if i < 0 || i >= len(m.chats) || i == m.selectedChat {
+		return m
+	}
+	m.selectedChat = i
+	m.msgScroll = -1
+	m.ensureChatVisible()
+	return m
+}
+
+// ── Scrolling ─────────────────────────────────────────────────────────────────
+
+// scrollMessages moves the message view by delta lines (negative = up).
+func (m Model) scrollMessages(delta int) Model {
+	mx := m.maxMsgScroll()
+	pos := m.msgScroll
+	if pos < 0 || pos > mx {
+		pos = mx
+	}
+	pos += delta
+	if pos >= mx {
+		m.msgScroll = -1 // back at the bottom: follow new messages again
+	} else {
+		m.msgScroll = max(0, pos)
+	}
+	return m
+}
+
+func (m Model) handleMouse(msg tea.MouseMsg) Model {
+	var delta int
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		delta = -3
+	case tea.MouseButtonWheelDown:
+		delta = 3
+	default:
+		return m
+	}
+	if msg.X < m.layout().chatInner+2 { // over the chat list
+		return m.selectChat(m.selectedChat + delta/3)
+	}
+	return m.scrollMessages(delta)
 }
 
 // ── Key handling ──────────────────────────────────────────────────────────────
 
-// rebuildFromGlobal replaces the model's chats and messages with the current
-// contents of the global maps (called after a HistorySync event).
-func (m Model) rebuildFromGlobal() Model {
-	m.state.ChatsMu.RLock()
-	newChats := make([]apptypes.ChatItem, 0, len(m.state.ChatsMap))
-	for _, c := range m.state.ChatsMap {
-		newChats = append(newChats, *c)
-	}
-	m.state.ChatsMu.RUnlock()
-
-	// Sort by last message time descending (most recent first), then name.
-	sort.Slice(newChats, func(i, j int) bool {
-		if !newChats[i].LastTime.Equal(newChats[j].LastTime) {
-			return newChats[i].LastTime.After(newChats[j].LastTime)
-		}
-		return newChats[i].Name < newChats[j].Name
-	})
-
-	// Keep selected chat pointed at same JID if possible.
-	var selectedJID string
-	if m.selectedChat >= 0 && m.selectedChat < len(m.chats) {
-		selectedJID = m.chats[m.selectedChat].JID.String()
-	}
-	newSelected := 0
-	for i, c := range newChats {
-		if c.JID.String() == selectedJID {
-			newSelected = i
-			break
-		}
-	}
-
-	m.chats = newChats
-	m.selectedChat = newSelected
-	m.chatScroll = 0
-	m = m.rebuildMessages()
-	return m
-}
-
-// rebuildMessages copies the global message map into the model's local copy.
-func (m Model) rebuildMessages() Model {
-	m.state.MessagesMu.RLock()
-	for k, v := range m.state.MessagesMap {
-		cp := make([]apptypes.Message, len(v))
-		copy(cp, v)
-		m.messages[k] = cp
-	}
-	m.state.MessagesMu.RUnlock()
-	return m
-}
-
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+c" {
+		return m, tea.Quit
+	}
+	if msg.String() == "ctrl+f" {
+		m.focus = focusSearch
+		return m, nil
+	}
 	switch m.focus {
+	case focusSearch:
+		return m.keySearch(msg)
 	case focusChatList:
 		return m.keyChatList(msg)
 	case focusMessages:
@@ -289,83 +300,110 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) keyChatList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
-	case "ctrl+c", "q":
+	case "q":
 		return m, tea.Quit
-
+	case "/":
+		m.focus = focusSearch
+	case "esc":
+		if m.search != "" {
+			m = m.setSearch("")
+		}
 	case "j", "down":
-		if m.selectedChat < len(m.chats)-1 {
-			m.selectedChat++
-			m.msgScroll = -1
-			vis := m.visibleChatRows()
-			if m.selectedChat >= m.chatScroll+vis {
-				m.chatScroll = m.selectedChat - vis + 1
-			}
-		}
-
+		m = m.selectChat(m.selectedChat + 1)
 	case "k", "up":
-		if m.selectedChat > 0 {
-			m.selectedChat--
-			m.msgScroll = -1
-			if m.selectedChat < m.chatScroll {
-				m.chatScroll = m.selectedChat
-			}
-		}
-
+		m = m.selectChat(m.selectedChat - 1)
+	case "pgdown":
+		m = m.selectChat(min(len(m.chats)-1, m.selectedChat+m.layout().chatRows))
+	case "pgup":
+		m = m.selectChat(max(0, m.selectedChat-m.layout().chatRows))
+	case "home", "g":
+		m = m.selectChat(0)
+	case "end", "G":
+		m = m.selectChat(len(m.chats) - 1)
 	case "enter":
 		if len(m.chats) > 0 {
 			m.focus = focusInput
-			m.chats[m.selectedChat].Unread = 0
-			key := m.chats[m.selectedChat].JID.String()
 			m.msgScroll = -1
-			return m, m.loadChatMsgs(key)
+			m = m.markSelectedRead()
 		}
-
 	case "tab":
 		if len(m.chats) > 0 {
 			m.focus = focusMessages
+			m = m.markSelectedRead()
+		}
+	}
+	return m, nil
+}
+
+// keySearch handles typing in the chat search bar. The list is filtered as
+// you type; Enter opens the selected match.
+func (m Model) keySearch(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	r := []rune(m.search)
+	switch k.String() {
+	case "esc":
+		m.focus = focusChatList
+		m = m.setSearch("")
+	case "tab":
+		m.focus = focusChatList // keep the filter
+	case "enter":
+		if len(m.chats) > 0 {
+			m.focus = focusInput
+			m = m.markSelectedRead()
+		}
+	case "down", "ctrl+n", "ctrl+j":
+		m = m.selectChat(m.selectedChat + 1)
+	case "up", "ctrl+p", "ctrl+k":
+		m = m.selectChat(m.selectedChat - 1)
+	case "backspace", "ctrl+h":
+		if len(r) > 0 {
+			m = m.setSearch(string(r[:len(r)-1]))
+		}
+	case "ctrl+w", "ctrl+u":
+		m = m.setSearch("")
+	default:
+		switch k.Type {
+		case tea.KeySpace:
+			m = m.setSearch(m.search + " ")
+		case tea.KeyRunes:
+			m = m.setSearch(m.search + strings.NewReplacer("\n", " ", "\r", "").Replace(string(k.Runes)))
 		}
 	}
 	return m, nil
 }
 
 func (m Model) keyMessages(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	page := m.layout().msgRows
 	switch k.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-
 	case "q", "esc":
 		m.focus = focusChatList
-
 	case "tab", "i":
 		m.focus = focusInput
-
 	case "j", "down":
-		if m.selectedChat >= 0 && m.selectedChat < len(m.chats) {
-			mx := m.maxMsgScroll(m.chats[m.selectedChat].JID.String())
-			if m.msgScroll < mx {
-				m.msgScroll++
-			}
-		}
-
+		m = m.scrollMessages(1)
 	case "k", "up":
-		if m.msgScroll > 0 {
-			m.msgScroll--
-		}
-
-	case "g":
+		m = m.scrollMessages(-1)
+	case "pgdown", "ctrl+d", " ":
+		m = m.scrollMessages(page)
+	case "pgup", "ctrl+u":
+		m = m.scrollMessages(-page)
+	case "g", "home":
 		m.msgScroll = 0
-
-	case "G":
+	case "G", "end":
 		m.msgScroll = -1
+	case "e":
+		m.showEdits = !m.showEdits
+		if m.showEdits {
+			m = m.flash("Showing edit history")
+		} else {
+			m = m.flash("Edit history hidden")
+		}
 	}
 	return m, nil
 }
 
 func (m Model) keyInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	r := []rune(m.inputText)
 	switch k.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-
 	case "esc":
 		m.focus = focusMessages
 
@@ -373,8 +411,8 @@ func (m Model) keyInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = focusChatList
 
 	case "enter":
-		if strings.TrimSpace(m.inputText) == "" ||
-			m.selectedChat < 0 || m.selectedChat >= len(m.chats) {
+		key := m.selectedKey()
+		if strings.TrimSpace(m.inputText) == "" || key == "" {
 			return m, nil
 		}
 		text := m.inputText
@@ -382,6 +420,7 @@ func (m Model) keyInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s := m.state
 		m.inputText = ""
 		m.inputCursor = 0
+		m.msgScroll = -1
 		return m, func() tea.Msg {
 			if err := client.SendMessage(s, jid, text); err != nil {
 				return tuiError{err}
@@ -389,71 +428,78 @@ func (m Model) keyInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return tuiStatus("Sent ✓")
 		}
 
+	case "pgup":
+		m = m.scrollMessages(-m.layout().msgRows)
+	case "pgdown":
+		m = m.scrollMessages(m.layout().msgRows)
+
 	case "backspace", "ctrl+h":
 		if m.inputCursor > 0 {
-			r := []rune(m.inputText)
-			m.inputText = string(r[:m.inputCursor-1]) + string(r[m.inputCursor:])
-			m.inputCursor--
+			m.setInput(string(r[:m.inputCursor-1])+string(r[m.inputCursor:]), m.inputCursor-1)
+		}
+
+	case "delete":
+		if m.inputCursor < len(r) {
+			m.setInput(string(r[:m.inputCursor])+string(r[m.inputCursor+1:]), m.inputCursor)
 		}
 
 	case "ctrl+w": // delete word backwards
-		if m.inputCursor > 0 {
-			r := []rune(m.inputText)
-			end := m.inputCursor
-			for end > 0 && r[end-1] == ' ' {
-				end--
-			}
-			for end > 0 && r[end-1] != ' ' {
-				end--
-			}
-			m.inputText = string(r[:end]) + string(r[m.inputCursor:])
-			m.inputCursor = end
+		end := m.inputCursor
+		for end > 0 && r[end-1] == ' ' {
+			end--
 		}
+		for end > 0 && r[end-1] != ' ' {
+			end--
+		}
+		m.setInput(string(r[:end])+string(r[m.inputCursor:]), end)
 
 	case "left":
-		if m.inputCursor > 0 {
-			m.inputCursor--
-		}
-
+		m.inputCursor = max(0, m.inputCursor-1)
 	case "right":
-		if m.inputCursor < utf8.RuneCountInString(m.inputText) {
-			m.inputCursor++
-		}
-
-	case "ctrl+a":
+		m.inputCursor = min(len(r), m.inputCursor+1)
+	case "ctrl+a", "home":
 		m.inputCursor = 0
-
-	case "ctrl+e":
-		m.inputCursor = utf8.RuneCountInString(m.inputText)
+	case "ctrl+e", "end":
+		m.inputCursor = len(r)
 
 	case "ctrl+k": // delete to end of line
-		r := []rune(m.inputText)
-		m.inputText = string(r[:m.inputCursor])
-
+		m.setInput(string(r[:m.inputCursor]), m.inputCursor)
 	case "ctrl+u": // delete to start of line
-		r := []rune(m.inputText)
-		m.inputText = string(r[m.inputCursor:])
-		m.inputCursor = 0
-
-	case " ": // space
-		r := []rune(m.inputText)
-		nr := make([]rune, 0, len(r)+1)
-		nr = append(nr, r[:m.inputCursor]...)
-		nr = append(nr, ' ')
-		nr = append(nr, r[m.inputCursor:]...)
-		m.inputText = string(nr)
-		m.inputCursor++
+		m.setInput(string(r[m.inputCursor:]), 0)
 
 	default:
-		if k.Type == tea.KeyRunes {
-			r := []rune(m.inputText)
-			nr := make([]rune, 0, len(r)+len(k.Runes))
-			nr = append(nr, r[:m.inputCursor]...)
-			nr = append(nr, k.Runes...)
-			nr = append(nr, r[m.inputCursor:]...)
-			m.inputText = string(nr)
-			m.inputCursor += len(k.Runes)
+		switch k.Type {
+		case tea.KeySpace:
+			m.insert([]rune{' '})
+		case tea.KeyRunes:
+			m.insert(k.Runes)
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) setInput(text string, cursor int) {
+	m.inputText = text
+	m.inputCursor = max(0, min(cursor, utf8.RuneCountInString(text)))
+}
+
+// insert inserts runes at the cursor. Newlines from pastes become spaces since
+// the input is a single line.
+func (m *Model) insert(in []rune) {
+	clean := make([]rune, 0, len(in))
+	for _, c := range in {
+		switch c {
+		case '\r':
+			continue
+		case '\n', '\t':
+			c = ' '
+		}
+		clean = append(clean, c)
+	}
+	r := []rune(m.inputText)
+	nr := make([]rune, 0, len(r)+len(clean))
+	nr = append(nr, r[:m.inputCursor]...)
+	nr = append(nr, clean...)
+	nr = append(nr, r[m.inputCursor:]...)
+	m.setInput(string(nr), m.inputCursor+len(clean))
 }

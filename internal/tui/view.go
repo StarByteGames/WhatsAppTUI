@@ -2,22 +2,42 @@ package tui
 
 import (
 	"fmt"
-	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
-	"os"
-	"os/exec"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/nfnt/resize"
+	"go.mau.fi/whatsmeow/types"
 
+	"DevStarByte/internal/state"
 	apptypes "DevStarByte/internal/types"
 )
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+
+// layout holds the panel dimensions derived from the terminal size. It is the
+// single source of truth for rendering and scrolling.
+//
+//	header:    1 line  (no border)
+//	mainRow:   innerH + 2 lines (border)
+//	inputBar:  1 + 2 = 3 lines (border)
+//	statusBar: 1 line  (no border)
+//	total = innerH + 7
+type layout struct {
+	innerH    int // inner height of the chat and message panels
+	chatInner int // inner width of the chat list
+	msgInner  int // inner width of the message panel
+	chatRows  int // visible chat list rows (minus title + divider)
+	msgRows   int // visible message lines (minus title + divider)
+}
+
+func (m Model) layout() layout {
+	l := layout{innerH: max(3, m.height-7), chatInner: 28}
+	// (chatInner+2) + (msgInner+2) = width
+	l.msgInner = max(10, m.width-l.chatInner-4)
+	l.chatRows = max(1, l.innerH-2)
+	l.msgRows = max(1, l.innerH-2)
+	return l
+}
 
 // ── View ──────────────────────────────────────────────────────────────────────
 
@@ -25,85 +45,54 @@ func (m Model) View() string {
 	if m.width < 40 || m.height < 10 {
 		return fmt.Sprintf("Terminal too small (%dx%d). Please resize.\n", m.width, m.height)
 	}
+	l := m.layout()
 
-	// Dimensions:
-	//   header:    1 line  (no border)
-	//   mainRow:   innerH + 2 lines (border)
-	//   inputBar:  1 + 2  = 3 lines (border)
-	//   statusBar: 1 line  (no border)
-	//   total = 1 + (innerH+2) + 3 + 1 = innerH + 7
-	innerH := m.height - 7
-	if innerH < 3 {
-		innerH = 3
-	}
-
-	// Panel inner widths.  outer = inner + 2 (border).
-	//   chatOuter + msgOuter = m.width
-	//   (chatInner+2) + (msgInner+2) = m.width
-	//   chatInner + msgInner = m.width - 4
-	chatInner := 28
-	msgInner := m.width - chatInner - 4
-	if msgInner < 10 {
-		msgInner = 10
-	}
-
-	// ── Header ────────────────────────────────────────────────────────────────
 	header := sHeader.Width(m.width - 2).
-		Render("WhatsApp TUI    Tab: switch panels    q: quit")
+		Render("WhatsApp TUI    Tab: switch panels    /: search chats    q: quit")
 
-	// ── Chat list panel ───────────────────────────────────────────────────────
-	chatContent := m.renderChatList(chatInner, innerH)
 	chatBorder := sIdle
-	if m.focus == focusChatList {
+	if m.focus == focusChatList || m.focus == focusSearch {
 		chatBorder = sActive
 	}
-	chatBox := chatBorder.Width(chatInner).MaxWidth(chatInner + 2).Height(innerH).Render(chatContent)
+	chatBox := chatBorder.Width(l.chatInner).MaxWidth(l.chatInner + 2).Height(l.innerH).
+		Render(m.renderChatList(l))
 
-	// ── Message panel ─────────────────────────────────────────────────────────
-	msgContent := m.renderMessages(msgInner, innerH)
 	msgBorder := sIdle
 	if m.focus == focusMessages {
 		msgBorder = sActive
 	}
-	msgBox := msgBorder.Width(msgInner).MaxWidth(msgInner + 2).Height(innerH).Render(msgContent)
-
-	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, chatBox, msgBox)
-
-	// ── Input bar ─────────────────────────────────────────────────────────────
-	inputBar := m.renderInput(m.width)
-
-	// ── Status bar ────────────────────────────────────────────────────────────
-	statusBar := m.renderStatus()
+	msgBox := msgBorder.Width(l.msgInner).MaxWidth(l.msgInner + 2).Height(l.innerH).
+		Render(m.renderMessages(l))
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
-		mainRow,
-		inputBar,
-		statusBar,
+		lipgloss.JoinHorizontal(lipgloss.Top, chatBox, msgBox),
+		m.renderInput(m.width),
+		m.renderStatus(),
 	)
 }
 
 // ── Chat list rendering ───────────────────────────────────────────────────────
 
-func (m Model) renderChatList(w, h int) string {
-	title := sAccent.Bold(true).Render("Chats")
-	divider := sDivider.Render(strings.Repeat("─", w))
-	lines := []string{title, divider}
-
-	visRows := h - 2
-	if visRows < 1 {
-		visRows = 1
+func (m Model) renderChatList(l layout) string {
+	w := l.chatInner
+	lines := []string{
+		m.renderChatTitle(w),
+		sDivider.Render(strings.Repeat("─", w)),
 	}
 
-	end := min(m.chatScroll+visRows, len(m.chats))
+	end := min(m.chatScroll+l.chatRows, len(m.chats))
 	for i := m.chatScroll; i < end; i++ {
 		c := m.chats[i]
-		name := truncateStr(c.Name, w-6)
 		badge := ""
 		if c.Unread > 0 {
 			badge = " " + sUnread.Render(fmt.Sprintf("(%d)", c.Unread))
 		}
-		row := name + badge
+		pin := ""
+		if c.Pinned() {
+			pin = "📌 "
+		}
+		row := pin + truncateStr(displayName(c), w-2-lipgloss.Width(pin)-lipgloss.Width(badge)) + badge
 		if i == m.selectedChat {
 			lines = append(lines, sChatSel.Width(w).Render(row))
 		} else {
@@ -111,229 +100,201 @@ func (m Model) renderChatList(w, h int) string {
 		}
 	}
 
-	if len(m.chats) == 0 {
+	switch {
+	case len(m.chats) > 0:
+	case m.search != "":
+		lines = append(lines, sMuted.Render("No chat matches."))
+	default:
 		lines = append(lines, sMuted.Render("No chats yet – waiting for messages…"))
 	}
 
 	return clampContent(strings.Join(lines, "\n"), w)
 }
 
+// renderChatTitle shows the search bar while searching or filtering, and the
+// panel title otherwise.
+func (m Model) renderChatTitle(w int) string {
+	if m.focus != focusSearch && m.search == "" {
+		return sAccent.Bold(true).Render("Chats") + sTime.Render("  / to search")
+	}
+	count := sTime.Render(fmt.Sprintf(" %d", len(m.chats)))
+	query := truncateStr(m.search, max(1, w-4-lipgloss.Width(count)))
+	if m.focus == focusSearch {
+		query += lipgloss.NewStyle().Reverse(true).Render(" ")
+	}
+	return sAccent.Bold(true).Render("/ ") + query + count
+}
+
+// displayName is the name shown for a chat. Chats without a known name show
+// their phone number, or a label if not even that is known (LIDs are
+// anonymous IDs, not phone numbers).
+func displayName(c apptypes.ChatItem) string {
+	switch {
+	case state.HasRealName(c):
+		return c.Name
+	case c.IsGroup:
+		return "Unnamed group"
+	case c.JID.Server == types.HiddenUserServer:
+		return "Unknown contact"
+	case c.JID.User != "":
+		return "+" + c.JID.User
+	}
+	return c.Name
+}
+
 // ── Message panel rendering ───────────────────────────────────────────────────
 
-func (m Model) renderMessages(w, h int) string {
-	var chatName, key string
-	if m.selectedChat >= 0 && m.selectedChat < len(m.chats) {
+func (m Model) renderMessages(l layout) string {
+	w := l.msgInner
+	key := m.selectedKey()
+	title := "Select a chat"
+	if key != "" {
 		c := m.chats[m.selectedChat]
-		chatName = c.Name
+		title = displayName(c)
 		if c.IsGroup {
-			chatName += " (group)"
+			title += " (group)"
 		}
-		key = c.JID.String()
 	}
-
-	title := sAccent.Bold(true).Render(orDefault(chatName, "Select a chat"))
-	divider := sDivider.Render(strings.Repeat("─", w))
-	header := []string{title, divider}
+	header := []string{
+		sAccent.Bold(true).Render(truncateStr(title, w)),
+		sDivider.Render(strings.Repeat("─", w)),
+	}
 
 	if key == "" {
 		hint := sMuted.Render("Use ↑/↓ to navigate the list, Enter or Tab to open a chat.")
 		return strings.Join(append(header, hint), "\n")
 	}
 
-	// Always read from the global map so history-sync'd messages are immediately visible.
-	m.state.MessagesMu.RLock()
-	msgs := make([]apptypes.Message, len(m.state.MessagesMap[key]))
-	copy(msgs, m.state.MessagesMap[key])
-	m.state.MessagesMu.RUnlock()
-
-	var msgLines []string
-	var lastDate string
-	for _, msg := range msgs {
-		// Insert date separator when the day changes.
-		dateStr := msg.Timestamp.Format("Jan 2, 2006")
-		if dateStr != lastDate {
-			lastDate = dateStr
-			label := sDateBadge.Render("── " + dateStr + " ──")
-			pad := (w - lipgloss.Width(label)) / 2
-			if pad < 0 {
-				pad = 0
-			}
-			msgLines = append(msgLines, strings.Repeat(" ", pad)+label)
-			msgLines = append(msgLines, "")
-		}
-		msgLines = append(msgLines, m.formatMsg(msg, w)...)
-		msgLines = append(msgLines, "") // blank separator
-	}
-
-	visH := h - 2
-	if visH < 1 {
-		visH = 1
-	}
+	msgLines := m.messageLines(key, w)
 	total := len(msgLines)
-	var offset int
-	if m.msgScroll < 0 {
-		// Negative scroll means "stick to bottom".
-		offset = max(0, total-visH)
-	} else {
-		offset = m.msgScroll
-		if offset+visH > total {
-			offset = max(0, total-visH)
-		}
+	if total == 0 {
+		hint := sMuted.Render("No messages yet. Type below and press Enter.")
+		return strings.Join(append(header, hint), "\n")
 	}
 
-	var visible []string
-	if total > 0 && offset < total {
-		end := min(offset+visH, total)
-		visible = msgLines[offset:end]
-	} else if total == 0 {
-		visible = []string{sMuted.Render("No messages yet. Type below and press Enter.")}
+	maxOffset := max(0, total-l.msgRows)
+	offset := maxOffset // msgScroll < 0: stick to the bottom
+	if m.msgScroll >= 0 {
+		offset = min(m.msgScroll, maxOffset)
+	}
+	visible := msgLines[offset:min(offset+l.msgRows, total)]
+
+	// Show that there is more below when scrolled up.
+	if offset < maxOffset && len(visible) > 0 {
+		visible[len(visible)-1] = sMuted.Render(fmt.Sprintf("  ↓ %d more lines (G to jump to bottom)", maxOffset-offset))
 	}
 
 	return clampContent(strings.Join(append(header, visible...), "\n"), w)
 }
 
-func (m Model) formatMsg(msg apptypes.Message, w int) []string {
-	ts := sTime.Render(msg.Timestamp.Format("15:04"))
+// messageLines renders all messages of a chat into terminal lines.
+func (m Model) messageLines(key string, w int) []string {
 	var lines []string
+	var lastDate string
+	for _, msg := range m.state.Messages(key) {
+		// Date separator whenever the day changes.
+		if dateStr := msg.Timestamp.Format("Jan 2, 2006"); dateStr != lastDate {
+			lastDate = dateStr
+			label := sDateBadge.Render("── " + dateStr + " ──")
+			pad := max(0, (w-lipgloss.Width(label))/2)
+			lines = append(lines, strings.Repeat(" ", pad)+label, "")
+		}
+		lines = append(lines, m.formatMsg(msg, w)...)
+		lines = append(lines, "")
+	}
+	return lines
+}
 
+// maxMsgScroll returns the largest scroll offset for the selected chat.
+func (m Model) maxMsgScroll() int {
+	key := m.selectedKey()
+	if key == "" {
+		return 0
+	}
+	l := m.layout()
+	return max(0, len(m.messageLines(key, l.msgInner))-l.msgRows)
+}
+
+func (m Model) formatMsg(msg apptypes.Message, w int) []string {
+	textW := max(1, w-6)
+
+	// Meta line: sender, time and state tags.
+	var meta string
 	if msg.FromMe {
-		meta := sTime.Render("You") + "  " + ts
-		wrapped := wordWrap(msg.Content, w-6)
-		// Right-align: pad lines to push them to the right.
-		for i, l := range wrapped {
-			styled := sMyMsg.Render(l)
-			pad := w - lipgloss.Width(styled) - 1
-			if pad < 0 {
-				pad = 0
+		meta = sTime.Render("You")
+	} else {
+		meta = sSender.Render(msg.Sender)
+	}
+	meta += "  " + sTime.Render(msg.Timestamp.Format("15:04"))
+	if len(msg.Edits) > 0 {
+		meta += sTime.Render(" · edited")
+		if !m.showEdits {
+			meta += sTime.Render(fmt.Sprintf(" (%d, e to show)", len(msg.Edits)))
+		}
+	}
+	if msg.Deleted {
+		meta += sDeletedTag.Render(" · deleted")
+	}
+
+	var body []string
+
+	// Previous versions of an edited message, oldest first.
+	if m.showEdits {
+		for _, v := range msg.Edits {
+			body = append(body, sEditLabel.Render("✎ "+formatVersionTime(v.Timestamp, msg.Timestamp)))
+			for _, l := range wordWrap(v.Content, textW) {
+				body = append(body, sEditOld.Render(l))
 			}
-			if i == 0 {
-				metaPad := w - lipgloss.Width(meta) - 1
-				if metaPad < 0 {
-					metaPad = 0
-				}
-				lines = append(lines, strings.Repeat(" ", metaPad)+meta)
-			}
-			lines = append(lines, strings.Repeat(" ", pad)+styled)
+		}
+		if len(msg.Edits) > 0 {
+			body = append(body, sEditLabel.Render("✎ current"))
+		}
+	}
+
+	bubble := sTheirMsg
+	if msg.FromMe {
+		bubble = sMyMsg
+	}
+	content := msg.Content
+	if msg.Deleted {
+		bubble = bubble.Foreground(clrDeleted)
+		if msg.IsPlaceholder() {
+			bubble = bubble.Italic(true)
+			content = "⊘ This message was deleted"
+		}
+	}
+	if content != "" {
+		for _, l := range wordWrap(content, textW) {
+			body = append(body, bubble.Render(l))
+		}
+	}
+
+	lines := []string{meta}
+	lines = append(lines, body...)
+	if msg.FromMe {
+		// Right-align own messages.
+		for i, line := range lines {
+			lines[i] = strings.Repeat(" ", max(0, w-lipgloss.Width(line)-1)) + line
 		}
 	} else {
-		meta := sSender.Render(msg.Sender) + "  " + ts
-		lines = append(lines, clampWidth(meta, w))
-		for _, l := range wordWrap(msg.Content, w-4) {
-			lines = append(lines, clampWidth(sTheirMsg.Render(l), w))
+		for i, line := range lines {
+			lines[i] = clampWidth(line, w)
 		}
 	}
 
-	// Render image inline if available.
 	if msg.ImagePath != "" {
-		if imgLines := renderImageBlock(msg.ImagePath, w-4); len(imgLines) > 0 {
-			lines = append(lines, imgLines...)
-		}
-	}
-
-	return lines
-}
-
-// imageRenderCache caches rendered terminal output per image path+width so
-// repeated View() calls don't re-render or re-exec chafa.
-var imageRenderCache sync.Map
-
-// renderImageBlock renders an image for the terminal.  It tries chafa(1)
-// first (which uses braille / block characters / sixel depending on the
-// terminal and produces much sharper output), then falls back to the
-// built-in half-block renderer.
-func renderImageBlock(imgPath string, maxCols int) []string {
-	cacheKey := fmt.Sprintf("%s:%d", imgPath, maxCols)
-	if cached, ok := imageRenderCache.Load(cacheKey); ok {
-		return cached.([]string)
-	}
-
-	lines := renderImageWithChafa(imgPath, maxCols)
-	if lines == nil {
-		lines = renderImageHalfBlock(imgPath, maxCols)
-	}
-
-	if lines != nil {
-		imageRenderCache.Store(cacheKey, lines)
+		lines = append(lines, renderImageBlock(msg.ImagePath, w-4)...)
 	}
 	return lines
 }
 
-// renderImageWithChafa shells out to chafa(1) for high-quality terminal
-// image rendering.  Returns nil if chafa is not installed.
-func renderImageWithChafa(imgPath string, maxCols int) []string {
-	cols := maxCols
-	rows := cols * 3 / 8 // roughly 3:8 aspect for compact look
-	cmd := exec.Command("chafa",
-		"--format", "symbols",
-		"--symbols", "all",
-		"--size", fmt.Sprintf("%dx%d", cols, rows),
-		imgPath,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
+// formatVersionTime shows only the time if the version is from the same day
+// as the original message, otherwise also the date.
+func formatVersionTime(t, original time.Time) string {
+	if t.Format("2006-01-02") == original.Format("2006-01-02") {
+		return t.Format("15:04")
 	}
-	result := strings.Split(strings.TrimRight(string(out), "\n\r"), "\n")
-	if len(result) == 0 || (len(result) == 1 && result[0] == "") {
-		return nil
-	}
-	return result
-}
-
-// renderImageHalfBlock converts an image into ANSI true-color half-block
-// characters (▄) as a fallback when chafa is not available.
-func renderImageHalfBlock(imgPath string, maxCols int) []string {
-	f, err := os.Open(imgPath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	img, _, err := image.Decode(f)
-	if err != nil {
-		return nil
-	}
-
-	// Resize to fit the panel width (compact: max 40 cols).
-	targetW := maxCols
-	if targetW > 40 {
-		targetW = 40
-	}
-	if targetW < 10 {
-		targetW = 10
-	}
-	img = resize.Resize(uint(targetW), 0, img, resize.Lanczos3)
-
-	bounds := img.Bounds()
-	w := bounds.Dx()
-	h := bounds.Dy()
-
-	var lines []string
-	// Process 2 rows of pixels at a time → 1 terminal row.
-	for y := bounds.Min.Y; y < bounds.Min.Y+h; y += 2 {
-		var sb strings.Builder
-		for x := bounds.Min.X; x < bounds.Min.X+w; x++ {
-			// Top pixel → background colour.
-			rt, gt, bt, _ := img.At(x, y).RGBA()
-			tr, tg, tb := rt>>8, gt>>8, bt>>8
-
-			// Bottom pixel → foreground colour (may be out of bounds).
-			var br, bg, bb uint32
-			if y+1 < bounds.Min.Y+h {
-				rb, gb, bb2, _ := img.At(x, y+1).RGBA()
-				br, bg, bb = rb>>8, gb>>8, bb2>>8
-			} else {
-				br, bg, bb = tr, tg, tb
-			}
-
-			// \033[48;2;R;G;Bm = set background, \033[38;2;R;G;Bm = set foreground
-			fmt.Fprintf(&sb, "\033[48;2;%d;%d;%dm\033[38;2;%d;%d;%dm▄",
-				tr, tg, tb, br, bg, bb)
-		}
-		sb.WriteString("\033[0m") // reset
-		lines = append(lines, sb.String())
-	}
-	return lines
+	return t.Format("Jan 2, 15:04")
 }
 
 // ── Input bar rendering ───────────────────────────────────────────────────────
@@ -344,35 +305,30 @@ func (m Model) renderInput(totalW int) string {
 	hint := sTime.Render("[Enter] send  [Esc] back  [Ctrl+W] del-word  [Tab] switch")
 	prefix := sAccent.Render("> ")
 
-	// Available space for the typed text (inside the border, minus prefix and hint).
-	innerW := totalW - lipgloss.Width(hint) - lipgloss.Width(prefix) - 4
-	if innerW < 1 {
-		innerW = 1
-	}
+	// Space for the typed text (inside the border, minus prefix and hint).
+	innerW := max(1, totalW-lipgloss.Width(hint)-lipgloss.Width(prefix)-4)
 
 	var display string
-	if active {
+	switch {
+	case active:
 		// Scroll the visible window so the cursor is always visible.
 		startR := max(0, m.inputCursor-innerW/2)
-		endR := min(len(r), startR+innerW)
+		endR := min(len(r), startR+innerW-1)
 		sub := r[startR:endR]
 		curIdx := m.inputCursor - startR
-
+		cursor := lipgloss.NewStyle().Reverse(true)
 		if curIdx < len(sub) {
-			before := string(sub[:curIdx])
-			cur := lipgloss.NewStyle().Reverse(true).Render(string(sub[curIdx : curIdx+1]))
-			after := string(sub[curIdx+1:])
-			display = before + cur + after
+			display = string(sub[:curIdx]) + cursor.Render(string(sub[curIdx])) + string(sub[curIdx+1:])
 		} else {
-			display = string(sub) + lipgloss.NewStyle().Reverse(true).Render(" ")
+			display = string(sub) + cursor.Render(" ")
 		}
-	} else if m.inputText == "" {
+	case m.inputText == "":
 		display = sMuted.Render("Tab to focus · select a chat first")
-	} else {
-		display = m.inputText
+	default:
+		display = truncateStr(m.inputText, innerW)
 	}
 
-	content := prefix + lipgloss.NewStyle().Width(innerW).Render(display) + hint
+	content := prefix + lipgloss.NewStyle().Width(innerW).MaxHeight(1).Render(display) + hint
 
 	border := sIdle
 	if active {
@@ -385,155 +341,27 @@ func (m Model) renderInput(totalW int) string {
 
 func (m Model) renderStatus() string {
 	conn := sAccent.Render("● Connected")
+	if !m.state.Connected() {
+		conn = sDeletedTag.Render("● Disconnected")
+	}
 
-	// Sync indicator.
 	var syncStatus string
-	if m.syncDone {
-		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrGreen).Render("Synced ✓")
-	} else if m.syncCount > 0 {
-		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrMuted).Render(fmt.Sprintf("Syncing… (%d)", m.syncCount))
-	} else {
-		syncStatus = "   " + lipgloss.NewStyle().Foreground(clrMuted).Render("Syncing…")
+	switch {
+	case m.syncDone:
+		syncStatus = "   " + sAccent.Render("Synced ✓")
+	case m.syncCount > 0:
+		syncStatus = "   " + sTime.Render(fmt.Sprintf("Syncing… (%d)", m.syncCount))
+	default:
+		syncStatus = "   " + sTime.Render("Syncing…")
 	}
 
 	flash := ""
 	if m.statusMsg != "" && time.Since(m.statusTime) < 4*time.Second {
 		flash = "   " + lipgloss.NewStyle().Foreground(clrText).Render(m.statusMsg)
 	}
-	keys := sTime.Render("  j/k navigate · g/G top/bottom · i type · q quit")
-	return sStatus.Width(m.width).Render(conn + syncStatus + flash + keys)
-}
-
-// ── Dimension helpers ─────────────────────────────────────────────────────────
-
-// visibleChatRows returns how many chat items fit in the list panel.
-func (m Model) visibleChatRows() int {
-	innerH := m.height - 7
-	return max(1, innerH-2) // subtract the title + divider rows
-}
-
-// maxMsgScroll returns the maximum scroll offset for the given chat.
-func (m Model) maxMsgScroll(key string) int {
-	m.state.MessagesMu.RLock()
-	msgs := make([]apptypes.Message, len(m.state.MessagesMap[key]))
-	copy(msgs, m.state.MessagesMap[key])
-	m.state.MessagesMu.RUnlock()
-	approxW := m.width - 28 - 4 - 4 // rough inner message width
-	var lines []string
-	for _, msg := range msgs {
-		lines = append(lines, m.formatMsg(msg, approxW)...)
-		lines = append(lines, "")
+	keys := sTime.Render("  j/k navigate · / search · g/G top/bottom · e edits · i type · q quit")
+	if m.focus == focusSearch {
+		keys = sTime.Render("  type to filter · ↑/↓ select · Enter open · Tab keep filter · Esc clear")
 	}
-	innerH := m.height - 7
-	visH := max(1, innerH-2)
-	return max(0, len(lines)-visH)
-}
-
-// ── Text utilities ────────────────────────────────────────────────────────────
-
-// mergeMessages merges two message slices, deduplicates by ID, and sorts by time.
-func mergeMessages(a, b []apptypes.Message) []apptypes.Message {
-	seen := make(map[string]bool, len(a)+len(b))
-	out := make([]apptypes.Message, 0, len(a)+len(b))
-	for _, m := range append(append([]apptypes.Message{}, a...), b...) {
-		if !seen[m.ID] {
-			seen[m.ID] = true
-			out = append(out, m)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Timestamp.Before(out[j].Timestamp)
-	})
-	return out
-}
-
-// truncateStr truncates s to maxW runes, appending "…" if needed.
-func truncateStr(s string, maxW int) string {
-	r := []rune(s)
-	if len(r) <= maxW {
-		return s
-	}
-	if maxW <= 1 {
-		return "…"
-	}
-	return string(r[:maxW-1]) + "…"
-}
-
-// wordWrap splits text into lines of at most width display columns, breaking at spaces.
-// It handles embedded newlines by splitting on them first.
-func wordWrap(text string, width int) []string {
-	if width <= 0 {
-		return []string{text}
-	}
-	// Handle embedded newlines.
-	var result []string
-	for _, paragraph := range strings.Split(text, "\n") {
-		result = append(result, wrapLine(paragraph, width)...)
-	}
-	return result
-}
-
-// wrapLine wraps a single line (no embedded newlines) to the given display width.
-func wrapLine(text string, width int) []string {
-	if width <= 0 {
-		return []string{text}
-	}
-	var result []string
-	r := []rune(text)
-	for len(r) > 0 {
-		if lipgloss.Width(string(r)) <= width {
-			result = append(result, string(r))
-			break
-		}
-		// Find the cut point where display width fits.
-		cut := 0
-		for cut < len(r) && lipgloss.Width(string(r[:cut+1])) <= width {
-			cut++
-		}
-		if cut == 0 {
-			cut = 1 // always consume at least one rune
-		}
-		// Try to break at a space.
-		spaceCut := cut
-		for spaceCut > 0 && r[spaceCut-1] != ' ' {
-			spaceCut--
-		}
-		if spaceCut > 0 {
-			cut = spaceCut
-		}
-		result = append(result, string(r[:cut]))
-		r = r[cut:]
-		for len(r) > 0 && r[0] == ' ' {
-			r = r[1:]
-		}
-	}
-	if len(result) == 0 {
-		result = []string{""}
-	}
-	return result
-}
-
-// clampWidth truncates a (possibly styled/ANSI) string to at most maxW display columns.
-func clampWidth(s string, maxW int) string {
-	if lipgloss.Width(s) <= maxW {
-		return s
-	}
-	return lipgloss.NewStyle().MaxWidth(maxW).Render(s)
-}
-
-// clampContent truncates every line in content to maxW display columns.
-func clampContent(content string, maxW int) string {
-	lines := strings.Split(content, "\n")
-	for i, l := range lines {
-		lines[i] = clampWidth(l, maxW)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// orDefault returns s if non-empty, otherwise def.
-func orDefault(s, def string) string {
-	if s != "" {
-		return s
-	}
-	return def
+	return sStatus.Width(m.width).MaxHeight(1).Render(conn + syncStatus + flash + keys)
 }

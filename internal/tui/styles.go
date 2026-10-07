@@ -14,6 +14,7 @@ var (
 	clrTheirBg  = lipgloss.Color("#202C33")
 	clrHeaderBg = lipgloss.Color("#202C33")
 	clrUnread   = lipgloss.Color("#00A884")
+	clrDeleted  = lipgloss.Color("#F15C6D")
 )
 
 // ── Lipgloss styles ───────────────────────────────────────────────────────────
@@ -86,4 +87,18 @@ var (
 	sDateBadge = lipgloss.NewStyle().
 			Foreground(clrMuted).
 			Bold(true)
+
+	sDeletedTag = lipgloss.NewStyle().
+			Foreground(clrDeleted).
+			Bold(true)
+
+	sEditLabel = lipgloss.NewStyle().
+			Foreground(clrMuted).
+			Italic(true)
+
+	sEditOld = lipgloss.NewStyle().
+			Foreground(clrMuted).
+			Strikethrough(true).
+			PaddingLeft(1).
+			PaddingRight(1)
 )
